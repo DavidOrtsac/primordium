@@ -12,6 +12,12 @@ export class Cell {
   wasFree = false; // true if this atom was also free the previous step
   energy = 1.0; // wild-mode metabolism — ignored when grid.energyEnabled is false
   playerControlled = false; // true → WASD bias force applies to this atom each step
+  // Cached crowding count — atoms within RADIUS*1.5, capped at 3.
+  // Precomputed once per tick at the top of computeVelocitiesAndReact so the
+  // inner pair loop can read it in O(1) instead of re-querying the spatial
+  // hash for every candidate. Safe because positions don't change between
+  // precompute and the pair loop (moveCells runs after).
+  crowdingCount = 0;
   // Render-only smoothed position (EMA toward loc). Physics never reads these.
   displayX = 0;
   displayY = 0;

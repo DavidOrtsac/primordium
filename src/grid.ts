@@ -71,6 +71,9 @@ export class Grid {
 
   get iterations(): number { return this._iterations; }
   get epoch(): number { return this._epoch; }
+  // Save/load support — bypass the normal step()-driven counter so a
+  // restored simulation reports the same iteration the save was taken at.
+  setIterations(n: number): void { this._iterations = n | 0; }
 
   create(width: number, height: number): void {
     this._epoch++;
@@ -153,9 +156,25 @@ export class Grid {
   }
 
   private computeVelocitiesAndReact(): void {
-    const searchSlots = Math.ceil(REACTION_RANGE / SLOT_SIZE) + 1;
+    // SLOT_SIZE (5*RADIUS) >= REACTION_RANGE (2.5*RADIUS), so a 3x3 slot
+    // window is provably sufficient: atoms in a slot 2 away are at min
+    // distance (k-1)*SLOT_SIZE = SLOT_SIZE > REACTION_RANGE apart. The
+    // previous +1 safety pad cost ~2.8x extra inner-loop work for nothing.
+    const searchSlots = Math.ceil(REACTION_RANGE / SLOT_SIZE);
     const nearby     = this._nearby;
     const candidates = this._candidates;
+
+    // Precompute crowding count per cell once per tick. The inner pair loop
+    // below would otherwise call countWithinRadius for every reaction
+    // candidate, which is a nested spatial query inside an already-spatial
+    // query — O(pairs_per_atom) wasted work per atom in dense regions.
+    // Caching gives bit-identical results because positions are read-only
+    // for the duration of computeVelocitiesAndReact (moveCells runs after).
+    const allCells = this.cells;
+    for (let i = 0; i < allCells.length; i++) {
+      const c = allCells[i];
+      c.crowdingCount = this.countWithinRadius(c.loc.x, c.loc.y, RADIUS * 1.5, 2);
+    }
 
     for (let cx = 0; cx < this.slotsX; cx++) {
       for (let cy = 0; cy < this.slotsY; cy++) {
@@ -197,9 +216,9 @@ export class Grid {
               const r2 = dx * dx + dy * dy;
 
               // Reaction candidate: within reaction range and not overcrowded.
+              // Read precomputed crowding instead of re-querying the hash.
               if (r2 < REACTION_RANGE2) {
-                const n = this.countWithinRadius(other.loc.x, other.loc.y, RADIUS * 1.5, 2);
-                if (n <= 1) candidates.push(other);
+                if (other.crowdingCount <= 1) candidates.push(other);
               }
 
               // No repulsion against unbonded state-0 atoms (free soup)
