@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Primordium</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #111;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: monospace;
+      color: #ccc;
+      gap: 12px;
+    }
+    .title-block { text-align: center; line-height: 1.4; }
+    .title-block h1 { font-size: 1.2rem; letter-spacing: 0.08em; color: #ddd; }
+    .title-block small { font-size: 0.7rem; color: #555; letter-spacing: 0.04em; }
+    canvas {
+      border: 1px solid #333;
+      image-rendering: pixelated;
+      transition: filter 0.4s ease;
+    }
+    /* Microscope view — phase-contrast slide aesthetic. CSS filter is GPU-cheap. */
+    canvas.microscope {
+      image-rendering: auto;
+      filter:
+        blur(0.9px)
+        contrast(1.22)
+        saturate(0.35)
+        brightness(0.98);
+      border-color: #333;
+    }
+    /* Vignette overlay for the microscope — sits on top of the canvas as a
+       darkening ring, like the edge fall-off of a real condenser lens. */
+    .scope-frame {
+      position: relative;
+      display: inline-block;
+      line-height: 0;
+    }
+    .scope-frame canvas#overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      border: none;
+      filter: none;
+    }
+    .scope-frame canvas#overlay.hidden { display: none; }
+    #status {
+      font-size: 0.7rem;
+      color: #666;
+      letter-spacing: 0.06em;
+    }
+    #game-overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 28px;
+      background: rgba(0,0,0,0.55);
+      z-index: 10;
+      font-family: monospace;
+      text-align: center;
+    }
+    #game-overlay-title {
+      font-size: 2.4rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      line-height: 1.2;
+      padding: 0 0.18em;          /* compensate for letter-spacing on the last letter */
+    }
+    #game-overlay-sub {
+      font-size: 0.95rem;
+      color: #bbb;
+      letter-spacing: 0.06em;
+      line-height: 1.4;
+    }
+    .scope-frame::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      border-radius: 0;
+      background: radial-gradient(
+        ellipse at center,
+        rgba(0,0,0,0)   55%,
+        rgba(0,0,0,0.35) 90%,
+        rgba(0,0,0,0.55) 100%
+      );
+      opacity: 0;
+      transition: opacity 0.4s ease;
+    }
+    .scope-frame.microscope::after { opacity: 1; }
+    .controls {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 0.8rem;
+    }
+    button {
+      background: #222;
+      color: #ccc;
+      border: 1px solid #444;
+      padding: 4px 14px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 0.85rem;
+      border-radius: 3px;
+    }
+    button:hover { background: #333; }
+    button:disabled { opacity: 0.35; cursor: not-allowed; }
+    button:disabled:hover { background: #222; }
+    button.active {
+      background: #2a1200;
+      border-color: #ff7700;
+      color: #ff9944;
+    }
+    button.active:hover { background: #3a1800; }
+    #rec-btn { min-width: 82px; }
+    button.recording {
+      background: #1a0000;
+      border-color: #cc0000;
+      color: #ff4444;
+      animation: blink 1.2s ease-in-out infinite;
+    }
+    button.recording:hover { background: #2a0000; }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.55; }
+    }
+    .hint { color: #555; font-size: 0.75rem; }
+    .sliders {
+      display: flex;
+      gap: 18px;
+      align-items: center;
+      font-size: 0.8rem;
+      color: #aaa;
+    }
+    .sliders label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .sliders input[type=range] {
+      width: 90px;
+      accent-color: #666;
+    }
+    .sliders .val {
+      color: #666;
+      min-width: 36px;
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+  <div class="title-block">
+    <h1>PRIMORDIUM</h1>
+    <small>by David Castro · based on <a href="https://github.com/timhutton/squirm3" target="_blank" rel="noopener" style="color:#888">Squirm3</a> by Tim Hutton (2007) · <a href="LICENSE" target="_blank" rel="noopener" style="color:#888">GPL v3</a></small>
+  </div>
+  <div id="scope-frame" class="scope-frame">
+    <canvas id="canvas"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="game-overlay">
+      <div id="game-overlay-title"></div>
+      <div id="game-overlay-sub"></div>
+    </div>
+  </div>
+  <div id="status">booting…</div>
+  <div class="controls">
+    <button id="pause-btn">Pause</button>
+    <button id="view-btn">View: Educational</button>
+    <button id="game-btn">🦠 Steer a microbe</button>
+    <button id="soup-brush-btn">🖌 Soup brush</button>
+    <button id="water-brush-btn">💧 Water brush</button>
+    <button id="clear-water-btn">Clear water</button>
+    <button id="lysin-btn">Lysin: OFF</button>
+    <button id="rec-btn">● REC</button>
+    <span class="hint">drag = pan · wheel = zoom · G = play mode (WASD biases your bacteria) · B = soup · W = water · C = clear water · Esc = pan · Space = pause · V = view · P = lysin · R = record</span>
+  </div>
+  <div class="sliders">
+    <label>speed
+      <input type="range" id="speed-slider" min="1" max="30" value="8">
+      <span class="val" id="speed-val">8</span>
+    </label>
+    <label>soup
+      <input type="range" id="soup-slider" min="0" max="100" value="60">
+      <span class="val" id="soup-val">60%</span>
+    </label>
+    <label>damp
+      <input type="range" id="damp-slider" min="50" max="100" value="100">
+      <span class="val" id="damp-val">1.00</span>
+    </label>
+  </div>
+  <script src="dist/bundle.js"></script>
+</body>
+</html>
