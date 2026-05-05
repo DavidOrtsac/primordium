@@ -1,0 +1,411 @@
+// Primordium — main thread.
+// Copyright (C) 2026 David Castro
+// Based on Squirm3 by Tim Hutton (2007), https://github.com/timhutton/squirm3
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License v3 (or any later version)
+// as published by the Free Software Foundation. See LICENSE for full terms.
+//
+// squirm3-pro main thread:
+//   • Owns the canvas + UI controls
+//   • Spawns the physics worker, sends control messages, receives snapshots
+//   • Picks WebGPU renderer when available, falls back to optimized Canvas 2D
+//   • The HUD/legend (educational view) renders into a sibling 2D overlay canvas
+//
+// No physics state lives here.
+
+import { ControlMsg, SnapshotMsg } from './snapshot';
+import { draw2D, drawHUD2D } from './renderer-2d';
+import { initGPU, drawGPU } from './renderer-gpu';
+
+// Big arena (~13× the original area). The canvas itself is viewport-sized;
+// we render only what the camera sees. Pan with mouse drag, zoom with wheel.
+const GRID_W = 5000;
+const GRID_H = 3000;
+const VIEW_W = 1400;
+const VIEW_H = 800;
+
+// ── Canvases ────────────────────────────────────────────────────────────────
+const canvas  = document.getElementById('canvas')  as HTMLCanvasElement;
+const overlay = document.getElementById('overlay') as HTMLCanvasElement;
+canvas.width  = VIEW_W;
+canvas.height = VIEW_H;
+overlay.width  = VIEW_W;
+overlay.height = VIEW_H;
+canvas.style.width  = VIEW_W + 'px';
+canvas.style.height = VIEW_H + 'px';
+overlay.style.width  = canvas.style.width;
+overlay.style.height = canvas.style.height;
+
+let ctx2d: CanvasRenderingContext2D | null = null;
+const overlayCtx = overlay.getContext('2d')!;
+
+// ── Camera ──────────────────────────────────────────────────────────────────
+// Convention: screen_xy = (world_xy - camera_xy) * zoom
+// Initial: fit arena to viewport (we let user zoom in from there).
+const fitZoom = Math.min(VIEW_W / GRID_W, VIEW_H / GRID_H);
+const camera = {
+  x: (GRID_W - VIEW_W / fitZoom) / 2,
+  y: (GRID_H - VIEW_H / fitZoom) / 2,
+  zoom: fitZoom,
+};
+const MIN_ZOOM = fitZoom * 0.5;
+const MAX_ZOOM = 6;
+
+// Mouse interactivity — behavior depends on brushMode (declared later but
+// referenced via closure that reads the mutable variable each event).
+let dragging = false;
+let lastMx = 0, lastMy = 0;
+
+function screenToWorld(clientX: number, clientY: number): { x: number; y: number } {
+  const rect = canvas.getBoundingClientRect();
+  const sx = clientX - rect.left;
+  const sy = clientY - rect.top;
+  return { x: sx / camera.zoom + camera.x, y: sy / camera.zoom + camera.y };
+}
+
+function applyBrushAt(clientX: number, clientY: number): void {
+  const w = screenToWorld(clientX, clientY);
+  if (brushMode === 'soup') {
+    send({ type: 'paintSoup', x: w.x, y: w.y, radius: SOUP_BRUSH_RADIUS, count: SOUP_BRUSH_RATE });
+  } else if (brushMode === 'water') {
+    send({ type: 'paintWater', x: w.x, y: w.y, radius: WATER_BRUSH_RADIUS });
+  }
+}
+
+canvas.addEventListener('mousedown', (e) => {
+  dragging = true; lastMx = e.clientX; lastMy = e.clientY;
+  if (brushMode === 'pan') {
+    canvas.style.cursor = 'grabbing';
+  } else {
+    applyBrushAt(e.clientX, e.clientY);
+  }
+});
+window.addEventListener('mousemove', (e) => {
+  if (!dragging) return;
+  if (brushMode === 'pan') {
+    const dx = e.clientX - lastMx, dy = e.clientY - lastMy;
+    camera.x -= dx / camera.zoom;
+    camera.y -= dy / camera.zoom;
+    lastMx = e.clientX; lastMy = e.clientY;
+  } else {
+    // For continuous brushing, fire on each move event. Water gets one droplet
+    // per move (sparse — surface tension makes overlapping ones still distinct);
+    // soup paints a steady stream of atoms.
+    const dx = e.clientX - lastMx, dy = e.clientY - lastMy;
+    if (dx * dx + dy * dy >= 6 * 6) { // ~6px movement threshold
+      applyBrushAt(e.clientX, e.clientY);
+      lastMx = e.clientX; lastMy = e.clientY;
+    }
+  }
+});
+window.addEventListener('mouseup', () => {
+  dragging = false;
+  canvas.style.cursor = brushMode === 'pan' ? 'grab' : 'crosshair';
+});
+canvas.style.cursor = 'grab';
+
+// Mouse wheel → zoom around cursor
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const worldX = mx / camera.zoom + camera.x;
+  const worldY = my / camera.zoom + camera.y;
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, camera.zoom * factor));
+  camera.x = worldX - mx / newZoom;
+  camera.y = worldY - my / newZoom;
+  camera.zoom = newZoom;
+}, { passive: false });
+
+// ── Worker ──────────────────────────────────────────────────────────────────
+const worker = new Worker('dist/worker.js');
+function send(msg: ControlMsg): void { worker.postMessage(msg); }
+function sendTransfer(msg: ControlMsg, transferables: Transferable[]): void {
+  worker.postMessage(msg, transferables);
+}
+
+// Latest snapshot held by main thread for rendering.
+// Because rAF and onmessage cannot interleave (JS single-threaded), it's safe
+// to immediately ship the previous snapshot's buffers back to the worker the
+// moment a new one arrives — no pendingReturn queue needed (and that queue
+// caused a deadlock when the worker only had 2 buffers in its pool).
+let lastSnapshot: SnapshotMsg | null = null;
+
+worker.onmessage = (e: MessageEvent<SnapshotMsg>) => {
+  if (e.data.type !== 'snapshot') return;
+  if (lastSnapshot) {
+    sendTransfer(
+      { type: 'reuse', atoms: lastSnapshot.atoms, loops: lastSnapshot.loops, bonds: lastSnapshot.bonds, droplets: lastSnapshot.droplets },
+      [lastSnapshot.atoms.buffer, lastSnapshot.loops.buffer, lastSnapshot.bonds.buffer, lastSnapshot.droplets.buffer],
+    );
+  }
+  lastSnapshot = e.data;
+};
+
+// ── State (UI-only) ─────────────────────────────────────────────────────────
+type Brush = 'pan' | 'soup' | 'water';
+let brushMode: Brush = 'pan';
+let paused = false;
+let lysinActive = false;
+let bacteriaView = false;
+let useGPU = false;
+let stepsPerFrame = 8;
+let gameMode = false;
+
+// Brush settings — controllable via UI later if needed
+const SOUP_BRUSH_RADIUS = 60;     // world units
+const SOUP_BRUSH_RATE   = 25;     // atoms per drag-step
+const WATER_BRUSH_RADIUS = 180;   // world units
+
+// ── Boot — WebGPU is the default. If the browser doesn't have WebGPU we
+// fall back to the optimized Canvas 2D renderer (also visually 1:1 with the
+// original). Either way physics runs in the worker.
+(async () => {
+  useGPU = await initGPU(canvas);
+  if (!useGPU) {
+    ctx2d = canvas.getContext('2d');
+    showStatus('Canvas 2D fallback (WebGPU unavailable in this browser)');
+  } else {
+    showStatus('WebGPU · physics in worker · larger arena');
+  }
+  send({ type: 'init', gridW: GRID_W, gridH: GRID_H, mode: 'rigged' });
+})();
+
+function showStatus(msg: string): void {
+  const el = document.getElementById('status');
+  if (el) el.textContent = msg;
+}
+
+// ── UI buttons ───────────────────────────────────────────────────────────────
+const pauseBtn       = document.getElementById('pause-btn')      as HTMLButtonElement;
+const lysinBtn       = document.getElementById('lysin-btn')      as HTMLButtonElement;
+const recBtn         = document.getElementById('rec-btn')        as HTMLButtonElement;
+const viewBtn        = document.getElementById('view-btn')       as HTMLButtonElement;
+const soupBrushBtn   = document.getElementById('soup-brush-btn') as HTMLButtonElement;
+const waterBrushBtn  = document.getElementById('water-brush-btn') as HTMLButtonElement;
+const clearWaterBtn  = document.getElementById('clear-water-btn') as HTMLButtonElement;
+const gameBtn        = document.getElementById('game-btn')        as HTMLButtonElement;
+const scopeFrame     = document.getElementById('scope-frame')    as HTMLDivElement;
+
+function togglePause(): void {
+  paused = !paused;
+  pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+  send({ type: 'pause', paused });
+}
+function toggleLysin(): void {
+  lysinActive = !lysinActive;
+  lysinBtn.textContent = lysinActive ? 'Lysin: ON' : 'Lysin: OFF';
+  lysinBtn.classList.toggle('active', lysinActive);
+  send({ type: 'toggleLysin', on: lysinActive });
+}
+function toggleView(): void {
+  bacteriaView = !bacteriaView;
+  viewBtn.textContent = bacteriaView ? 'View: Microscope' : 'View: Educational';
+  viewBtn.classList.toggle('active', bacteriaView);
+  canvas.classList.toggle('microscope', bacteriaView);
+  scopeFrame.classList.toggle('microscope', bacteriaView);
+  overlay.classList.toggle('hidden', bacteriaView);
+}
+
+function setBrush(next: Brush): void {
+  brushMode = brushMode === next ? 'pan' : next;
+  soupBrushBtn.classList.toggle('active', brushMode === 'soup');
+  waterBrushBtn.classList.toggle('active', brushMode === 'water');
+  canvas.style.cursor = brushMode === 'pan' ? 'grab' : 'crosshair';
+}
+function clearWater(): void { send({ type: 'clearWater' }); }
+
+// Buttons that are HIDDEN while in microbe-steering mode — controls that
+// don't fit a "you-vs-them" game (sandbox tools).
+const GAME_HIDDEN_BTN_IDS = ['pause-btn', 'soup-brush-btn', 'water-brush-btn', 'clear-water-btn', 'lysin-btn'];
+
+function applyGameModeUI(): void {
+  for (const id of GAME_HIDDEN_BTN_IDS) {
+    const el = document.getElementById(id);
+    if (el) (el as HTMLElement).style.display = gameMode ? 'none' : '';
+  }
+  // Brush state cannot persist into game mode (no brush tools available).
+  if (gameMode) brushMode = 'pan';
+  hideGameOverlay();
+}
+
+function toggleGame(): void {
+  gameMode = !gameMode;
+  gameBtn.textContent = gameMode ? '🦠 Exit game' : '🦠 Steer a microbe';
+  gameBtn.classList.toggle('active', gameMode);
+  send({ type: gameMode ? 'startGame' : 'endGame' });
+  keyState.w = keyState.a = keyState.s = keyState.d = false;
+  send({ type: 'setPlayerInput', x: 0, y: 0 });
+  applyGameModeUI();
+}
+
+// ── Win/Lose overlay ───────────────────────────────────────────────────────
+const overlayEl = document.getElementById('game-overlay') as HTMLDivElement;
+const overlayTitle = document.getElementById('game-overlay-title') as HTMLDivElement;
+const overlaySub   = document.getElementById('game-overlay-sub')   as HTMLDivElement;
+let overlayShownStatus = 0;
+
+function showGameOverlay(status: number): void {
+  if (overlayShownStatus === status) return;
+  overlayShownStatus = status;
+  if (status === 1) {
+    overlayTitle.textContent = '🏆 You won';
+    overlayTitle.style.color = '#5edca0';
+    overlaySub.textContent = 'No enemy cells survived for 5 seconds.';
+  } else {
+    overlayTitle.textContent = '☠ You died';
+    overlayTitle.style.color = '#ff6464';
+    overlaySub.textContent = 'All your cells were lysed.';
+  }
+  overlayEl.style.display = 'flex';
+}
+function hideGameOverlay(): void {
+  overlayShownStatus = 0;
+  overlayEl.style.display = 'none';
+}
+
+// ── WASD input → biased Brownian. We track which of W/A/S/D are down and
+// send a normalized direction vector to the worker whenever the set changes.
+const keyState = { w: false, a: false, s: false, d: false };
+function pushPlayerInput(): void {
+  if (!gameMode) return;
+  let dx = 0, dy = 0;
+  if (keyState.d) dx += 1;
+  if (keyState.a) dx -= 1;
+  if (keyState.s) dy += 1;
+  if (keyState.w) dy -= 1;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len > 0) { dx /= len; dy /= len; }
+  send({ type: 'setPlayerInput', x: dx, y: dy });
+}
+
+// ── Recording ───────────────────────────────────────────────────────────────
+let mediaRecorder: MediaRecorder | null = null;
+let recChunks: Blob[] = [];
+let recTimer: number | null = null;
+let recStart = 0;
+function bestMime(): string {
+  const order = ['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];
+  return order.find(t => MediaRecorder.isTypeSupported(t)) ?? 'video/webm';
+}
+function fmtTime(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+function toggleRecording(): void {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') { mediaRecorder.stop(); return; }
+  const mime = bestMime();
+  const stream = canvas.captureStream(30);
+  mediaRecorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 6_000_000 });
+  recChunks = [];
+  mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recChunks.push(e.data); };
+  mediaRecorder.onstart = () => {
+    recStart = Date.now();
+    recBtn.classList.add('recording');
+    recTimer = window.setInterval(() => { recBtn.textContent = `■ ${fmtTime(Date.now() - recStart)}`; }, 500);
+  };
+  mediaRecorder.onstop = () => {
+    if (recTimer !== null) { clearInterval(recTimer); recTimer = null; }
+    recBtn.classList.remove('recording');
+    recBtn.textContent = '● REC';
+    const ext  = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+    const blob = new Blob(recChunks, { type: mime });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = `primordium-${Date.now()}.${ext}`; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  };
+  mediaRecorder.start(200);
+}
+
+// ── Sliders ─────────────────────────────────────────────────────────────────
+const speedSlider = document.getElementById('speed-slider') as HTMLInputElement;
+const speedVal    = document.getElementById('speed-val')!;
+const soupSlider  = document.getElementById('soup-slider') as HTMLInputElement;
+const soupVal     = document.getElementById('soup-val')!;
+const dampSlider  = document.getElementById('damp-slider') as HTMLInputElement;
+const dampVal     = document.getElementById('damp-val')!;
+
+speedSlider.addEventListener('input', () => {
+  stepsPerFrame = parseInt(speedSlider.value);
+  speedVal.textContent = speedSlider.value;
+  send({ type: 'setStepsPerFrame', n: stepsPerFrame });
+});
+soupSlider.addEventListener('input', () => {
+  const v = parseInt(soupSlider.value) / 100;
+  soupVal.textContent = soupSlider.value + '%';
+  send({ type: 'setThermalScale', v });
+});
+dampSlider.addEventListener('input', () => {
+  const v = parseInt(dampSlider.value) / 100;
+  dampVal.textContent = v.toFixed(2);
+  send({ type: 'setBondedDamping', v });
+});
+
+// ── Hooks ───────────────────────────────────────────────────────────────────
+pauseBtn.addEventListener('click', togglePause);
+lysinBtn.addEventListener('click', toggleLysin);
+viewBtn.addEventListener('click', toggleView);
+soupBrushBtn.addEventListener('click', () => setBrush('soup'));
+waterBrushBtn.addEventListener('click', () => setBrush('water'));
+clearWaterBtn.addEventListener('click', clearWater);
+gameBtn.addEventListener('click', toggleGame);
+recBtn.addEventListener('click', toggleRecording);
+
+document.addEventListener('keydown', (e) => {
+  // In game mode, WASD is reserved for the player. We still allow other shortcuts.
+  if (gameMode && (e.code === 'KeyW' || e.code === 'KeyA' || e.code === 'KeyS' || e.code === 'KeyD')) {
+    if (e.code === 'KeyW') keyState.w = true;
+    if (e.code === 'KeyA') keyState.a = true;
+    if (e.code === 'KeyS') keyState.s = true;
+    if (e.code === 'KeyD') keyState.d = true;
+    pushPlayerInput();
+    return;
+  }
+  if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  if (e.code === 'KeyP')  { toggleLysin(); }
+  if (e.code === 'KeyR')  { toggleRecording(); }
+  if (e.code === 'KeyB')  { setBrush('soup'); }
+  if (e.code === 'KeyW')  { setBrush('water'); }
+  if (e.code === 'KeyC')  { clearWater(); }
+  if (e.code === 'KeyV')  { toggleView(); }
+  if (e.code === 'KeyG')  { toggleGame(); }
+  if (e.code === 'Escape') { setBrush('pan'); }
+});
+document.addEventListener('keyup', (e) => {
+  if (!gameMode) return;
+  if (e.code === 'KeyW') { keyState.w = false; pushPlayerInput(); }
+  if (e.code === 'KeyA') { keyState.a = false; pushPlayerInput(); }
+  if (e.code === 'KeyS') { keyState.s = false; pushPlayerInput(); }
+  if (e.code === 'KeyD') { keyState.d = false; pushPlayerInput(); }
+});
+
+// ── Render loop ─────────────────────────────────────────────────────────────
+function loop(): void {
+  const snap = lastSnapshot;
+  if (snap) {
+    if (gameMode) {
+      if (snap.gameStatus === 1 || snap.gameStatus === 2) showGameOverlay(snap.gameStatus);
+      else hideGameOverlay();
+    }
+    if (useGPU) {
+      drawGPU(snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
+      overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+      if (!bacteriaView) drawHUD2D(overlayCtx, snap.iterations, snap.atomCount, snap.atoms);
+    } else if (ctx2d) {
+      draw2D(ctx2d, snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
+      if (!bacteriaView) {
+        // HUD always in screen space — reset transform first
+        ctx2d.setTransform(1, 0, 0, 1, 0, 0);
+        drawHUD2D(ctx2d, snap.iterations, snap.atomCount, snap.atoms);
+      }
+    }
+  }
+  // also keep stepsPerFrame in sync (so worker has it after init)
+  void stepsPerFrame;
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
