@@ -52,7 +52,78 @@ export type ControlMsg =
   | { type: 'startGame' }
   | { type: 'endGame' }
   | { type: 'setPlayerInput'; x: number; y: number }
+  | { type: 'setDripFeed'; on: boolean; soupInterval: number; waterInterval: number }
+  | { type: 'burn'; targetIters: number }
+  | { type: 'abortBurn' }
+  | { type: 'setSeed'; seed: number }
+  | { type: 'requestSave' }
+  | { type: 'loadSave'; state: SaveState }
   | { type: 'reuse'; atoms: Float32Array; loops: Uint32Array; bonds: Uint32Array; droplets: Float32Array };
+
+// Serialized full simulation state for save/load round-trip. Designed so
+// loading is bit-identical (same seed + same RNG state + same atoms/bonds/
+// droplets/iter counter → same future). Schema-versioned so we can evolve
+// the format later without silently corrupting old saves.
+export type SaveState = {
+  magic: 'primordium-save';
+  version: 1;
+  savedAt: string;          // ISO 8601 — informational only
+  // Grid metadata
+  gridW: number;
+  gridH: number;
+  iterations: number;
+  // Reproducibility
+  seed: number;
+  rngState: number;
+  // Sim parameters
+  thermalScale: number;
+  bondedDamping: number;
+  // Drip-feed config
+  dripFeed: boolean;
+  dripSoupInterval: number;
+  dripWaterInterval: number;
+  // Cells (parallel arrays for compact JSON)
+  cellX:    number[];
+  cellY:    number[];
+  cellVx:   number[];
+  cellVy:   number[];
+  cellType: string[];        // single-character per cell
+  cellState:  number[];
+  cellEnergy: number[];
+  cellPlayer: number[];      // 0/1
+  // Bonds — flat [i0, j0, i1, j1, ...] with i < j
+  bonds: number[];
+  // Water droplets
+  dropX: number[];
+  dropY: number[];
+  dropR: number[];
+};
+
+export type SaveStateMsg = {
+  type: 'saveState';
+  state: SaveState;
+};
+export type LoadResultMsg = {
+  type: 'loadResult';
+  ok: boolean;
+  error?: string;
+  iterations?: number;
+  cellCount?: number;
+  seed?: number;
+};
+
+// Worker → main messages other than 'snapshot'.
+export type BurnProgressMsg = {
+  type: 'burnProgress';
+  iterations: number;
+  target: number;
+  stepsPerSec: number;
+};
+export type BurnDoneMsg = {
+  type: 'burnDone';
+  iterations: number;
+  aborted: boolean;
+};
 
 // Pack typeCharCode + state into a single f32 bit-pattern.
 // We use Uint32 bit reinterpretation through a tiny aliased view.

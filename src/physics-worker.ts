@@ -22,10 +22,34 @@ import { Cell } from './cell';
 import { initSimple, buildCell, seedLysin, removeLysin, seedPredatorCells, removePredatorCells, seedSoup, Q } from './init';
 import { initWild, generateRandomChemistry, wildTick } from './wild';
 import {
-  ControlMsg, SnapshotMsg, STRIDE,
+  ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg,
+  SaveState, SaveStateMsg, LoadResultMsg, STRIDE,
   packTypeState, allocAtomsBuffer, allocLoopsBuffer, allocBondsBuffer, allocDropletsBuffer,
   MAX_ATOMS, MAX_LOOP_VERTS_TOTAL, MAX_BONDS, MAX_DROPLETS,
 } from './snapshot';
+
+// ── Seedable PRNG (mulberry32) ──────────────────────────────────────────────
+// We monkey-patch Math.random in the worker so every existing call site
+// (grid.ts, chemistry.ts, init.ts) draws from a deterministic stream
+// without source changes. Save/load preserves _rngState so a restored
+// simulation continues with the exact same future as the original would
+// have produced.
+let _rngState = 0x9E3779B9; // arbitrary nonzero default until 'init' message
+let _seed = 1;
+function mulberry32(): number {
+  _rngState = (_rngState + 0x6D2B79F5) | 0;
+  let t = _rngState;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+function seedRNG(seed: number): void {
+  _seed = seed >>> 0;
+  _rngState = seed >>> 0 || 0x9E3779B9; // avoid pathological all-zero state
+  Math.random = mulberry32;
+}
+// Apply immediately so any module-init RNG calls are already deterministic.
+seedRNG(_seed);
 
 type Mode = 'rigged' | 'wild';
 
@@ -42,6 +66,17 @@ let gridH = 0;
 let stepsPerFrame = 8;
 let paused = false;
 let inGame = false;
+// Drip-feed (sandbox-mode passive replenishment) — same machinery as the
+// game's respawn timers but configurable, no lysin, gated by !inGame.
+let dripFeed = false;
+let dripSoupInterval  = 700;
+let dripWaterInterval = 4250;
+// Headless burn — fast-forward the simulation without rendering. The normal
+// 60Hz tick loop bows out (sees `burning` and stops scheduling) and a tight
+// loop in burnLoop() takes over, yielding to the message queue every chunk
+// so abort/paint/etc. can still be processed.
+let burning = false;
+let burnTarget = 0;
 const SOUP_RESPAWN_INTERVAL   = 700;   // ticks between soup waves
 const SOUP_RESPAWN_PATCHES    = 5;
 const SOUP_RESPAWN_PER_PATCH  = 90;    // 5 × 90 = 450 atoms per wave
@@ -418,6 +453,118 @@ function postSnapshot(): void {
   ]);
 }
 
+// ── Save / Load ────────────────────────────────────────────────────────────
+// Serialize the entire simulation to a plain object (JSON-friendly). The
+// main thread turns this into a downloadable .json file.
+function buildSaveState(): SaveState {
+  const cells = grid.getCells();
+  const indexMap = new Map<Cell, number>();
+  for (let i = 0; i < cells.length; i++) indexMap.set(cells[i], i);
+
+  const cellX:    number[] = [];
+  const cellY:    number[] = [];
+  const cellVx:   number[] = [];
+  const cellVy:   number[] = [];
+  const cellType: string[] = [];
+  const cellState:  number[] = [];
+  const cellEnergy: number[] = [];
+  const cellPlayer: number[] = [];
+  for (const c of cells) {
+    cellX.push(c.loc.x);  cellY.push(c.loc.y);
+    cellVx.push(c.vel.x); cellVy.push(c.vel.y);
+    cellType.push(c.type); cellState.push(c.state);
+    cellEnergy.push(c.energy); cellPlayer.push(c.playerControlled ? 1 : 0);
+  }
+
+  const bondList: number[] = [];
+  for (let i = 0; i < cells.length; i++) {
+    for (const other of cells[i].bonds) {
+      const j = indexMap.get(other);
+      if (j === undefined || j <= i) continue;
+      bondList.push(i, j);
+    }
+  }
+
+  const dropX: number[] = [];
+  const dropY: number[] = [];
+  const dropR: number[] = [];
+  for (const d of grid.droplets) { dropX.push(d.x); dropY.push(d.y); dropR.push(d.r); }
+
+  return {
+    magic: 'primordium-save',
+    version: 1,
+    savedAt: new Date().toISOString(),
+    gridW, gridH,
+    iterations: grid.iterations,
+    seed: _seed,
+    rngState: _rngState,
+    thermalScale: grid.thermalScale,
+    bondedDamping: grid.bondedDamping,
+    dripFeed,
+    dripSoupInterval, dripWaterInterval,
+    cellX, cellY, cellVx, cellVy, cellType, cellState, cellEnergy, cellPlayer,
+    bonds: bondList,
+    dropX, dropY, dropR,
+  };
+}
+
+// Restore a previously saved state. Returns null on success, or an error
+// message string on failure. Loading rebuilds the grid from scratch.
+function loadSaveState(s: SaveState): string | null {
+  if (s.magic !== 'primordium-save') return 'Not a Primordium save file';
+  if (s.version !== 1) return `Unsupported save version: ${s.version}`;
+  if (!Array.isArray(s.cellX)) return 'Corrupt save: missing cells';
+
+  // Bring the worker's grid + chemistry to a clean rigged-mode baseline,
+  // then drop in the saved atoms/bonds/droplets.
+  gridW = s.gridW;
+  gridH = s.gridH;
+  grid = new Grid();
+  grid.create(gridW, gridH);
+  grid.getChemistry().clear();
+  grid.energyEnabled = false;
+  grid.getChemistry().mutationRate = 0;
+  initSimple(grid, [], 0); // re-register chemistry rules without seeding any cells
+
+  const newCells: Cell[] = [];
+  for (let i = 0; i < s.cellX.length; i++) {
+    const cell = grid.createCell(s.cellX[i], s.cellY[i], s.cellType[i], s.cellState[i]);
+    cell.vel.x = s.cellVx[i];
+    cell.vel.y = s.cellVy[i];
+    cell.energy = s.cellEnergy[i];
+    cell.playerControlled = !!s.cellPlayer[i];
+    newCells.push(cell);
+  }
+  for (let b = 0; b < s.bonds.length; b += 2) {
+    const i = s.bonds[b], j = s.bonds[b + 1];
+    if (i >= 0 && i < newCells.length && j >= 0 && j < newCells.length) {
+      newCells[i].bondTo(newCells[j]);
+    }
+  }
+  grid.droplets = [];
+  for (let i = 0; i < s.dropX.length; i++) {
+    grid.droplets.push({ x: s.dropX[i], y: s.dropY[i], r: s.dropR[i] });
+  }
+  grid.setIterations(s.iterations);
+  grid.thermalScale  = s.thermalScale;
+  grid.bondedDamping = s.bondedDamping;
+  // Drip
+  dripFeed         = s.dripFeed;
+  dripSoupInterval = s.dripSoupInterval;
+  dripWaterInterval = s.dripWaterInterval;
+  // RNG — restore exact stream position so future steps match the saver's
+  _seed     = s.seed;
+  _rngState = s.rngState;
+  Math.random = mulberry32;
+  // Reset game/burn state — the user just loaded a fresh snapshot of the world
+  inGame = false;
+  gameStatus = 0;
+  noEnemyStartIter = -1;
+  burning = false;
+  burnTarget = 0;
+  return null;
+}
+
 // ── Fixed-cadence physics loop ─────────────────────────────────────────────
 // Target rate = 60 ticks/sec so simulation speed feels identical to the
 // original rAF-driven loop. Each tick runs `stepsPerFrame` physics steps and
@@ -427,18 +574,88 @@ const TARGET_HZ = 60;
 const TARGET_DT_MS = 1000 / TARGET_HZ;
 let nextTickAt = 0;
 
+// Promise wrapper around setTimeout(0) so we can `await` a yield to the
+// worker's message queue between burn chunks. This is how abort + brush
+// messages get processed during a long burn — workers can't preempt, but
+// they CAN drain queued messages between turns of the event loop.
+function yieldToQueue(): Promise<void> {
+  return new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+}
+
+// Headless burn loop. Runs grid.step() as fast as the worker can manage,
+// emits progress every ~250ms, yields to the message queue between chunks
+// so abort/paint/etc. continue to work, and posts a final snapshot when
+// done so the main thread sees the new state.
+async function burnLoop(): Promise<void> {
+  burning = true;
+  let aborted = false;
+  let lastProgressT  = performance.now();
+  let lastProgressIt = grid.iterations;
+  // Chunk size = how many steps before we yield. Bigger = faster (less yield
+  // overhead) but slower abort response. 5000 ≈ 1-2 seconds of work at peak,
+  // which keeps abort latency tolerable.
+  const CHUNK = 5000;
+
+  while (burning && grid.iterations < burnTarget) {
+    const stopAt = Math.min(burnTarget, grid.iterations + CHUNK);
+    while (grid.iterations < stopAt) runOneStep();
+
+    const now = performance.now();
+    if (now - lastProgressT > 250) {
+      const dIt = grid.iterations - lastProgressIt;
+      const dT  = (now - lastProgressT) / 1000;
+      const progress: BurnProgressMsg = {
+        type: 'burnProgress',
+        iterations: grid.iterations,
+        target: burnTarget,
+        stepsPerSec: dT > 0 ? Math.round(dIt / dT) : 0,
+      };
+      self.postMessage(progress);
+      lastProgressT  = now;
+      lastProgressIt = grid.iterations;
+    }
+    // Yield so abortBurn / paintSoup / paintWater / clearWater can run.
+    await yieldToQueue();
+  }
+
+  if (!burning) aborted = true;       // abortBurn flipped the flag
+  burning = false;
+  // Resume normal tick cadence (this also emits a fresh snapshot).
+  nextTickAt = 0;
+  postSnapshot();
+  const done: BurnDoneMsg = {
+    type: 'burnDone',
+    iterations: grid.iterations,
+    aborted,
+  };
+  self.postMessage(done);
+  tick();
+}
+
+// One physics step plus all per-step side-effects (mode-specific tick,
+// game/drip respawn timers). Extracted so the burn loop runs the EXACT same
+// per-step semantics as the live tick — bit-identical evolution between
+// "watch live" and "fast-forward."
+function runOneStep(): void {
+  grid.step();
+  if (mode === 'wild') wildTick(grid);
+  if (grid.iterations > 0) {
+    if (inGame && gameStatus === 0) {
+      if (grid.iterations % SOUP_RESPAWN_INTERVAL  === 0) spawnRandomSoupPatches();
+      if (grid.iterations % WATER_RESPAWN_INTERVAL === 0) spawnRandomWaterDrop();
+      if (grid.iterations % LYSIN_RESPAWN_INTERVAL === 0) spawnLysinSpot();
+    } else if (!inGame && dripFeed) {
+      if (dripSoupInterval  > 0 && grid.iterations % dripSoupInterval  === 0) spawnRandomSoupPatches();
+      if (dripWaterInterval > 0 && grid.iterations % dripWaterInterval === 0) spawnRandomWaterDrop();
+    }
+  }
+}
+
 function tick(): void {
+  if (burning) return; // burn loop owns the worker; tick will be re-armed when burn finishes
   const now = performance.now();
   if (!paused && gridW > 0) {
-    for (let i = 0; i < stepsPerFrame; i++) {
-      grid.step();
-      if (mode === 'wild') wildTick(grid);
-      if (inGame && gameStatus === 0 && grid.iterations > 0) {
-        if (grid.iterations % SOUP_RESPAWN_INTERVAL  === 0) spawnRandomSoupPatches();
-        if (grid.iterations % WATER_RESPAWN_INTERVAL === 0) spawnRandomWaterDrop();
-        if (grid.iterations % LYSIN_RESPAWN_INTERVAL === 0) spawnLysinSpot();
-      }
-    }
+    for (let i = 0; i < stepsPerFrame; i++) runOneStep();
     postSnapshot();
   }
   // Schedule the next tick relative to the *target* cadence. If physics took
@@ -463,9 +680,32 @@ self.onmessage = (e: MessageEvent<unknown>) => {
       gridW = msg.gridW;
       gridH = msg.gridH;
       mode  = msg.mode;
+      // Use the default seed=1 unless main thread reseeds explicitly. Apply
+      // before setup so the initial layout is deterministic for that seed.
+      seedRNG(_seed);
       if (mode === 'rigged') setupRigged(); else setupWild();
       tick();
       return;
+    case 'setSeed':
+      // Re-seed AND restart the rigged setup so the new seed actually drives
+      // a fresh deterministic layout. Without the reset, the seed only
+      // affects future RNG calls, which is rarely what users mean.
+      seedRNG(msg.seed);
+      setupRigged();
+      return;
+    case 'requestSave': {
+      const out: SaveStateMsg = { type: 'saveState', state: buildSaveState() };
+      self.postMessage(out);
+      return;
+    }
+    case 'loadSave': {
+      const err = loadSaveState(msg.state);
+      const result: LoadResultMsg = err
+        ? { type: 'loadResult', ok: false, error: err }
+        : { type: 'loadResult', ok: true, iterations: grid.iterations, cellCount: grid.getCells().length, seed: _seed };
+      self.postMessage(result);
+      return;
+    }
     case 'pause':
       paused = msg.paused;
       return;
@@ -544,6 +784,24 @@ self.onmessage = (e: MessageEvent<unknown>) => {
     case 'setPlayerInput':
       grid.playerInputX = msg.x;
       grid.playerInputY = msg.y;
+      return;
+    case 'setDripFeed':
+      dripFeed = msg.on;
+      // Clamp to >0 so we never modulo-by-zero. UI is responsible for sane defaults.
+      if (msg.soupInterval  > 0) dripSoupInterval  = msg.soupInterval;
+      if (msg.waterInterval > 0) dripWaterInterval = msg.waterInterval;
+      return;
+    case 'burn':
+      // Ignore burn-while-burning; if user wants to extend, abort + restart.
+      if (burning) return;
+      burnTarget = Math.max(grid.iterations, msg.targetIters);
+      // Kick off the async burn loop. It flips `burning = true` and tick()
+      // self-suspends on its next firing (or it's already idle).
+      void burnLoop();
+      return;
+    case 'abortBurn':
+      // Flips the loop guard; the loop notices on its next CHUNK boundary.
+      burning = false;
       return;
     case 'reuse':
       atomsPool.push(msg.atoms);

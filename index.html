@@ -98,21 +98,46 @@
       transition: opacity 0.4s ease;
     }
     .scope-frame.microscope::after { opacity: 1; }
-    .controls {
+    /* ── Control bar ──────────────────────────────────────────────────────
+       Multi-row layout so buttons don't sprawl horizontally. Each row is a
+       semantic group; rows are separated by margin so groups feel distinct. */
+    .control-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: center;
+      width: min(100%, 1400px);
+    }
+    .ctl-row {
       display: flex;
       gap: 10px;
       align-items: center;
+      flex-wrap: wrap;
+      justify-content: center;
       font-size: 0.8rem;
+    }
+    .ctl-group {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .ctl-divider {
+      width: 1px;
+      height: 18px;
+      background: #2a2a2a;
+      margin: 0 4px;
     }
     button {
       background: #222;
       color: #ccc;
       border: 1px solid #444;
-      padding: 4px 14px;
+      padding: 5px 12px;
       cursor: pointer;
       font-family: monospace;
-      font-size: 0.85rem;
+      font-size: 0.82rem;
       border-radius: 3px;
+      min-height: 28px;
+      white-space: nowrap;
     }
     button:hover { background: #333; }
     button:disabled { opacity: 0.35; cursor: not-allowed; }
@@ -135,7 +160,84 @@
       0%, 100% { opacity: 1; }
       50%       { opacity: 0.55; }
     }
-    .hint { color: #555; font-size: 0.75rem; }
+    /* Game-mode button — visually isolated so users don't misclick into
+       it. Distinct color, lower visual weight, separate row, right-aligned. */
+    #game-btn {
+      background: #0e1a14;
+      border-color: #2c5040;
+      color: #6fb59a;
+      letter-spacing: 0.04em;
+    }
+    #game-btn:hover { background: #14241c; border-color: #3c6a55; }
+    #game-btn.active {
+      background: #1a2b22;
+      border-color: #5edca0;
+      color: #b6f0d3;
+    }
+    .game-row {
+      display: flex;
+      justify-content: flex-end;
+      width: min(100%, 1400px);
+      margin-top: 2px;
+      padding-top: 6px;
+      border-top: 1px dashed #1c1c1c;
+    }
+    .game-row .game-label {
+      color: #444;
+      font-size: 0.7rem;
+      margin-right: 8px;
+      align-self: center;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    /* Burn iters + seed inputs — match button styling */
+    #burn-iters, #seed-input {
+      background: #1a1a1a;
+      color: #ccc;
+      border: 1px solid #444;
+      padding: 5px 6px;
+      font-family: monospace;
+      font-size: 0.82rem;
+      border-radius: 3px;
+      width: 90px;
+      min-height: 28px;
+    }
+    #seed-input { width: 80px; }
+    .ctl-label {
+      color: #777;
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
+    }
+    /* Inline drip-config sliders, shown only when Drip is on */
+    .inline-sliders {
+      display: none;
+      gap: 12px;
+      align-items: center;
+      color: #888;
+      font-size: 0.75rem;
+    }
+    .inline-sliders.shown { display: inline-flex; }
+    .inline-sliders label { display: inline-flex; align-items: center; gap: 5px; }
+    .inline-sliders input[type=range] { width: 70px; accent-color: #666; }
+    .inline-sliders .val { color: #aaa; min-width: 38px; text-align: right; }
+    /* Hint row — small, dim, wraps cleanly under the controls */
+    .hint-row {
+      color: #4a4a4a;
+      font-size: 0.7rem;
+      max-width: min(100%, 1300px);
+      text-align: center;
+      line-height: 1.5;
+      padding: 0 12px;
+    }
+    .hint-row kbd {
+      background: #181818;
+      border: 1px solid #2a2a2a;
+      border-radius: 2px;
+      padding: 0 4px;
+      color: #888;
+      font-family: monospace;
+    }
+    /* Slider row — bottom of the control bar */
     .sliders {
       display: flex;
       gap: 18px;
@@ -157,6 +259,15 @@
       min-width: 36px;
       text-align: right;
     }
+    /* Status line — slightly more prominent so action feedback is visible */
+    #status {
+      font-size: 0.72rem;
+      color: #777;
+      letter-spacing: 0.04em;
+      min-height: 1.2em;
+      transition: color 0.2s ease;
+    }
+    #status.flash { color: #ddd; }
   </style>
 </head>
 <body>
@@ -173,30 +284,104 @@
     </div>
   </div>
   <div id="status">booting…</div>
-  <div class="controls">
-    <button id="pause-btn">Pause</button>
-    <button id="view-btn">View: Educational</button>
-    <button id="game-btn">🦠 Steer a microbe</button>
-    <button id="soup-brush-btn">🖌 Soup brush</button>
-    <button id="water-brush-btn">💧 Water brush</button>
-    <button id="clear-water-btn">Clear water</button>
-    <button id="lysin-btn">Lysin: OFF</button>
-    <button id="rec-btn">● REC</button>
-    <span class="hint">drag = pan · wheel = zoom · G = play mode (WASD biases your bacteria) · B = soup · W = water · C = clear water · Esc = pan · Space = pause · V = view · P = lysin · R = record</span>
-  </div>
-  <div class="sliders">
-    <label>speed
-      <input type="range" id="speed-slider" min="1" max="30" value="8">
-      <span class="val" id="speed-val">8</span>
-    </label>
-    <label>soup
-      <input type="range" id="soup-slider" min="0" max="100" value="60">
-      <span class="val" id="soup-val">60%</span>
-    </label>
-    <label>damp
-      <input type="range" id="damp-slider" min="50" max="100" value="100">
-      <span class="val" id="damp-val">1.00</span>
-    </label>
+  <div class="control-bar">
+
+    <!-- Row 1: simulation tools (view + brushes + lysin) -->
+    <div class="ctl-row">
+      <div class="ctl-group">
+        <button id="pause-btn">Pause</button>
+        <button id="view-btn">View: Educational</button>
+      </div>
+      <div class="ctl-divider"></div>
+      <div class="ctl-group">
+        <button id="soup-brush-btn">🖌 Soup brush</button>
+        <button id="water-brush-btn">💧 Water brush</button>
+        <button id="clear-water-btn">Clear water</button>
+        <button id="lysin-btn">Lysin: OFF</button>
+      </div>
+    </div>
+
+    <!-- Row 2: passive replenishment + fast-forward + record -->
+    <div class="ctl-row">
+      <div class="ctl-group">
+        <button id="drip-btn">💧 Drip: OFF</button>
+        <span class="inline-sliders" id="drip-sliders">
+          <label>soup
+            <input type="range" id="drip-soup-slider" min="100" max="3000" value="700" step="50">
+            <span class="val" id="drip-soup-val">700</span> tk
+          </label>
+          <label>water
+            <input type="range" id="drip-water-slider" min="500" max="15000" value="4250" step="100">
+            <span class="val" id="drip-water-val">4250</span> tk
+          </label>
+        </span>
+      </div>
+      <div class="ctl-divider"></div>
+      <div class="ctl-group">
+        <span class="ctl-label">⏩ Burn</span>
+        <input id="burn-iters" type="number" value="100000" min="1000" step="10000">
+        <span class="ctl-label">iters</span>
+        <button id="burn-btn">Start</button>
+      </div>
+      <div class="ctl-divider"></div>
+      <button id="rec-btn">● REC</button>
+    </div>
+
+    <!-- Row 3: thermodynamics sliders -->
+    <div class="ctl-row sliders">
+      <label>speed
+        <input type="range" id="speed-slider" min="1" max="30" value="8">
+        <span class="val" id="speed-val">8</span>
+      </label>
+      <label>soup
+        <input type="range" id="soup-slider" min="0" max="100" value="60">
+        <span class="val" id="soup-val">60%</span>
+      </label>
+      <label>damp
+        <input type="range" id="damp-slider" min="50" max="100" value="100">
+        <span class="val" id="damp-val">1.00</span>
+      </label>
+    </div>
+
+    <!-- Row 3.5: research-instrument tools — seed, save/load, CSV stats.
+         These don't disrupt the sim; they let you reproduce, archive, and
+         export data for actual experiments. -->
+    <div class="ctl-row">
+      <div class="ctl-group">
+        <span class="ctl-label">🎲 seed</span>
+        <input id="seed-input" type="number" value="1" min="0" step="1">
+        <button id="seed-apply-btn">Reseed</button>
+      </div>
+      <div class="ctl-divider"></div>
+      <div class="ctl-group">
+        <button id="save-btn">💾 Save</button>
+        <button id="load-btn">📂 Load</button>
+      </div>
+      <div class="ctl-divider"></div>
+      <div class="ctl-group">
+        <span class="ctl-label">📊 stats</span>
+        <button id="csv-btn">Download CSV</button>
+        <button id="csv-clear-btn">Clear</button>
+        <span id="csv-count" class="ctl-label">0 rows</span>
+      </div>
+    </div>
+
+    <!-- Row 4: GAME MODE — isolated, right-aligned, separate visual band so
+         users don't misclick into a sim-disrupting mode change. -->
+    <div class="game-row">
+      <span class="game-label">play mode</span>
+      <button id="game-btn">🦠 Steer a microbe</button>
+    </div>
+
+    <!-- Row 5: keybindings hint, dim and small -->
+    <div class="hint-row">
+      <kbd>drag</kbd> pan · <kbd>wheel</kbd> zoom ·
+      <kbd>Space</kbd> pause · <kbd>V</kbd> view ·
+      <kbd>B</kbd> soup brush · <kbd>W</kbd> water brush ·
+      <kbd>C</kbd> clear water · <kbd>P</kbd> lysin ·
+      <kbd>R</kbd> record · <kbd>G</kbd> play mode ·
+      <kbd>Esc</kbd> back to pan
+    </div>
   </div>
   <script src="dist/bundle.js"></script>
 </body>

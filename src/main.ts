@@ -14,8 +14,8 @@
 //
 // No physics state lives here.
 
-import { ControlMsg, SnapshotMsg } from './snapshot';
-import { draw2D, drawHUD2D } from './renderer-2d';
+import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, SaveState, STRIDE } from './snapshot';
+import { draw2D, draw2DClassic, drawHUD2D } from './renderer-2d';
 import { initGPU, drawGPU } from './renderer-gpu';
 
 // Big arena (~13× the original area). The canvas itself is viewport-sized;
@@ -134,23 +134,35 @@ function sendTransfer(msg: ControlMsg, transferables: Transferable[]): void {
 // caused a deadlock when the worker only had 2 buffers in its pool).
 let lastSnapshot: SnapshotMsg | null = null;
 
-worker.onmessage = (e: MessageEvent<SnapshotMsg>) => {
-  if (e.data.type !== 'snapshot') return;
-  if (lastSnapshot) {
-    sendTransfer(
-      { type: 'reuse', atoms: lastSnapshot.atoms, loops: lastSnapshot.loops, bonds: lastSnapshot.bonds, droplets: lastSnapshot.droplets },
-      [lastSnapshot.atoms.buffer, lastSnapshot.loops.buffer, lastSnapshot.bonds.buffer, lastSnapshot.droplets.buffer],
-    );
+type WorkerMsg = SnapshotMsg | BurnProgressMsg | BurnDoneMsg | SaveStateMsg | LoadResultMsg;
+
+worker.onmessage = (e: MessageEvent<WorkerMsg>) => {
+  const data = e.data;
+  if (data.type === 'snapshot') {
+    if (lastSnapshot) {
+      sendTransfer(
+        { type: 'reuse', atoms: lastSnapshot.atoms, loops: lastSnapshot.loops, bonds: lastSnapshot.bonds, droplets: lastSnapshot.droplets },
+        [lastSnapshot.atoms.buffer, lastSnapshot.loops.buffer, lastSnapshot.bonds.buffer, lastSnapshot.droplets.buffer],
+      );
+    }
+    lastSnapshot = data;
+    if (statsRecording) recordStatsRow(data);
+    return;
   }
-  lastSnapshot = e.data;
+  if (data.type === 'burnProgress') { onBurnProgress(data); return; }
+  if (data.type === 'burnDone')     { onBurnDone(data);     return; }
+  if (data.type === 'saveState')    { onSaveState(data);    return; }
+  if (data.type === 'loadResult')   { onLoadResult(data);   return; }
 };
 
 // ── State (UI-only) ─────────────────────────────────────────────────────────
 type Brush = 'pan' | 'soup' | 'water';
+type ViewMode = 'educational' | 'microscope' | 'classic';
 let brushMode: Brush = 'pan';
 let paused = false;
 let lysinActive = false;
-let bacteriaView = false;
+let viewMode: ViewMode = 'educational';
+let bacteriaView = false; // mirror of viewMode === 'microscope', used by GPU/2D draw paths
 let useGPU = false;
 let stepsPerFrame = 8;
 let gameMode = false;
@@ -174,9 +186,26 @@ const WATER_BRUSH_RADIUS = 180;   // world units
   send({ type: 'init', gridW: GRID_W, gridH: GRID_H, mode: 'rigged' });
 })();
 
+// Status line — central log surface. logStatus() is the action-feedback
+// channel; every meaningful UI action calls it so the user always sees what
+// just happened. The 'flash' class brightens the text briefly so the eye
+// catches new messages even at a glance.
+const statusEl = document.getElementById('status');
+let statusFlashTimer: number | null = null;
 function showStatus(msg: string): void {
-  const el = document.getElementById('status');
-  if (el) el.textContent = msg;
+  if (statusEl) statusEl.textContent = msg;
+}
+function logStatus(msg: string): void {
+  if (!statusEl) return;
+  statusEl.textContent = msg;
+  statusEl.classList.add('flash');
+  if (statusFlashTimer !== null) clearTimeout(statusFlashTimer);
+  statusFlashTimer = window.setTimeout(() => {
+    statusEl.classList.remove('flash');
+    statusFlashTimer = null;
+  }, 600);
+  // Also mirror to console so power users can scroll the history.
+  console.log('[primordium]', msg);
 }
 
 // ── UI buttons ───────────────────────────────────────────────────────────────
@@ -188,39 +217,168 @@ const soupBrushBtn   = document.getElementById('soup-brush-btn') as HTMLButtonEl
 const waterBrushBtn  = document.getElementById('water-brush-btn') as HTMLButtonElement;
 const clearWaterBtn  = document.getElementById('clear-water-btn') as HTMLButtonElement;
 const gameBtn        = document.getElementById('game-btn')        as HTMLButtonElement;
+const dripBtn        = document.getElementById('drip-btn')        as HTMLButtonElement;
+const burnBtn        = document.getElementById('burn-btn')        as HTMLButtonElement;
+const burnIters      = document.getElementById('burn-iters')      as HTMLInputElement;
+const dripSlidersRow = document.getElementById('drip-sliders')    as HTMLDivElement;
+const dripSoupSlider  = document.getElementById('drip-soup-slider') as HTMLInputElement;
+const dripWaterSlider = document.getElementById('drip-water-slider') as HTMLInputElement;
+const dripSoupVal     = document.getElementById('drip-soup-val')!;
+const dripWaterVal    = document.getElementById('drip-water-val')!;
+const seedInput       = document.getElementById('seed-input')      as HTMLInputElement;
+const seedApplyBtn    = document.getElementById('seed-apply-btn')  as HTMLButtonElement;
+const saveBtn         = document.getElementById('save-btn')        as HTMLButtonElement;
+const loadBtn         = document.getElementById('load-btn')        as HTMLButtonElement;
+const csvBtn          = document.getElementById('csv-btn')         as HTMLButtonElement;
+const csvClearBtn     = document.getElementById('csv-clear-btn')   as HTMLButtonElement;
+const csvCount        = document.getElementById('csv-count')!;
 const scopeFrame     = document.getElementById('scope-frame')    as HTMLDivElement;
 
 function togglePause(): void {
   paused = !paused;
   pauseBtn.textContent = paused ? 'Resume' : 'Pause';
   send({ type: 'pause', paused });
+  logStatus(paused ? 'Simulation paused' : 'Simulation resumed');
 }
 function toggleLysin(): void {
   lysinActive = !lysinActive;
   lysinBtn.textContent = lysinActive ? 'Lysin: ON' : 'Lysin: OFF';
   lysinBtn.classList.toggle('active', lysinActive);
   send({ type: 'toggleLysin', on: lysinActive });
+  logStatus(lysinActive ? 'Lysin seeded — membranes will dissolve on contact' : 'Lysin removed');
 }
+// Cycle: Educational → Microscope → Classic → Educational
 function toggleView(): void {
-  bacteriaView = !bacteriaView;
-  viewBtn.textContent = bacteriaView ? 'View: Microscope' : 'View: Educational';
-  viewBtn.classList.toggle('active', bacteriaView);
-  canvas.classList.toggle('microscope', bacteriaView);
-  scopeFrame.classList.toggle('microscope', bacteriaView);
-  overlay.classList.toggle('hidden', bacteriaView);
+  viewMode = viewMode === 'educational' ? 'microscope'
+           : viewMode === 'microscope'  ? 'classic'
+           :                              'educational';
+  bacteriaView = viewMode === 'microscope';
+  const label = viewMode === 'educational' ? 'Educational'
+              : viewMode === 'microscope'  ? 'Microscope'
+              :                              'Classic';
+  viewBtn.textContent = `View: ${label}`;
+  viewBtn.classList.toggle('active', viewMode !== 'educational');
+  // Microscope CSS effects only apply in microscope mode
+  canvas.classList.toggle('microscope', viewMode === 'microscope');
+  scopeFrame.classList.toggle('microscope', viewMode === 'microscope');
+  // Overlay holds the HUD (educational) and the whole classic render. Hide
+  // it only in microscope mode where the main canvas owns the visuals.
+  overlay.classList.toggle('hidden', viewMode === 'microscope');
+  // Wipe the overlay on every mode change so a stale classic frame can't
+  // bleed into educational/microscope before the next render fires.
+  overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+  overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+  const desc = viewMode === 'educational' ? 'legend + bonds + bezier membranes'
+             : viewMode === 'microscope'  ? 'phase contrast (microscope slide)'
+             :                              "Hutton's 2002 squares + straight bond lines";
+  logStatus(`View → ${label} (${desc})`);
 }
 
 function setBrush(next: Brush): void {
+  const prev = brushMode;
   brushMode = brushMode === next ? 'pan' : next;
   soupBrushBtn.classList.toggle('active', brushMode === 'soup');
   waterBrushBtn.classList.toggle('active', brushMode === 'water');
   canvas.style.cursor = brushMode === 'pan' ? 'grab' : 'crosshair';
+  if (prev !== brushMode) {
+    if (brushMode === 'pan')   logStatus('Brush off — drag pans the camera');
+    if (brushMode === 'soup')  logStatus('Soup brush ON — click & drag to seed atoms');
+    if (brushMode === 'water') logStatus('Water brush ON — click to drop water (touching droplets fuse)');
+  }
 }
-function clearWater(): void { send({ type: 'clearWater' }); }
+function clearWater(): void {
+  send({ type: 'clearWater' });
+  logStatus('Cleared all water droplets');
+}
 
 // Buttons that are HIDDEN while in microbe-steering mode — controls that
 // don't fit a "you-vs-them" game (sandbox tools).
-const GAME_HIDDEN_BTN_IDS = ['pause-btn', 'soup-brush-btn', 'water-brush-btn', 'clear-water-btn', 'lysin-btn'];
+const GAME_HIDDEN_BTN_IDS = ['pause-btn', 'soup-brush-btn', 'water-brush-btn', 'clear-water-btn', 'lysin-btn', 'drip-btn', 'burn-btn', 'burn-iters'];
+
+// ── Drip feed (sandbox passive replenishment) ──────────────────────────────
+let dripOn = false;
+function pushDripState(): void {
+  send({
+    type: 'setDripFeed',
+    on: dripOn,
+    soupInterval:  parseInt(dripSoupSlider.value),
+    waterInterval: parseInt(dripWaterSlider.value),
+  });
+}
+function toggleDrip(): void {
+  dripOn = !dripOn;
+  dripBtn.textContent = dripOn ? '💧 Drip: ON' : '💧 Drip: OFF';
+  dripBtn.classList.toggle('active', dripOn);
+  dripSlidersRow.classList.toggle('shown', dripOn);
+  pushDripState();
+  logStatus(dripOn
+    ? `Drip feed ON — soup every ${dripSoupSlider.value} ticks · water every ${dripWaterSlider.value} ticks`
+    : 'Drip feed OFF');
+}
+dripSoupSlider.addEventListener('input', () => {
+  dripSoupVal.textContent = dripSoupSlider.value;
+  if (dripOn) {
+    pushDripState();
+    logStatus(`Drip soup interval → every ${dripSoupSlider.value} ticks`);
+  }
+});
+dripWaterSlider.addEventListener('input', () => {
+  dripWaterVal.textContent = dripWaterSlider.value;
+  if (dripOn) {
+    pushDripState();
+    logStatus(`Drip water interval → every ${dripWaterSlider.value} ticks`);
+  }
+});
+
+// ── Headless burn ──────────────────────────────────────────────────────────
+let burning = false;
+let burnStartIter = 0;
+let burnTargetIter = 0;
+const burnDefaultLabel = 'Start';
+let burnWallStart = 0;
+
+function startBurn(): void {
+  if (burning) { send({ type: 'abortBurn' }); logStatus('Aborting burn…'); return; }
+  const requested = Math.max(1000, Math.floor(parseInt(burnIters.value) || 100000));
+  const startIter = lastSnapshot?.iterations ?? 0;
+  burnStartIter  = startIter;
+  burnTargetIter = startIter + requested;
+  burnWallStart  = performance.now();
+  burning = true;
+  burnBtn.classList.add('recording');
+  burnBtn.textContent = '✕ Cancel (0%)';
+  send({ type: 'burn', targetIters: burnTargetIter });
+  logStatus(`Burn started → +${requested.toLocaleString()} iters (target ${burnTargetIter.toLocaleString()})`);
+}
+
+function onBurnProgress(p: BurnProgressMsg): void {
+  if (!burning) return;
+  const span = burnTargetIter - burnStartIter;
+  const done = p.iterations - burnStartIter;
+  const pct  = span > 0 ? Math.min(100, Math.round((done / span) * 100)) : 100;
+  burnBtn.textContent = `✕ Cancel (${pct}%)`;
+  // Estimate ETA from current rate.
+  const remaining = Math.max(0, burnTargetIter - p.iterations);
+  const etaSec = p.stepsPerSec > 0 ? Math.round(remaining / p.stepsPerSec) : 0;
+  showStatus(
+    `Burning · iter ${p.iterations.toLocaleString()} / ${p.target.toLocaleString()} ` +
+    `(${pct}%) · ${p.stepsPerSec.toLocaleString()} steps/sec · ETA ${etaSec}s`
+  );
+}
+
+function onBurnDone(d: BurnDoneMsg): void {
+  burning = false;
+  burnBtn.classList.remove('recording');
+  burnBtn.textContent = burnDefaultLabel;
+  const wallSec = (performance.now() - burnWallStart) / 1000;
+  const itersDone = d.iterations - burnStartIter;
+  const rate = wallSec > 0 ? Math.round(itersDone / wallSec) : 0;
+  if (d.aborted) {
+    logStatus(`Burn cancelled @ iter ${d.iterations.toLocaleString()} · processed ${itersDone.toLocaleString()} iters in ${wallSec.toFixed(1)}s (${rate.toLocaleString()} steps/sec)`);
+  } else {
+    logStatus(`Burn complete @ iter ${d.iterations.toLocaleString()} · ${itersDone.toLocaleString()} iters in ${wallSec.toFixed(1)}s (${rate.toLocaleString()} steps/sec)`);
+  }
+}
 
 function applyGameModeUI(): void {
   for (const id of GAME_HIDDEN_BTN_IDS) {
@@ -240,6 +398,9 @@ function toggleGame(): void {
   keyState.w = keyState.a = keyState.s = keyState.d = false;
   send({ type: 'setPlayerInput', x: 0, y: 0 });
   applyGameModeUI();
+  logStatus(gameMode
+    ? 'Play mode ON — WASD biases your green microbe (Brownian, not propulsion)'
+    : 'Play mode OFF — sandbox restored');
 }
 
 // ── Win/Lose overlay ───────────────────────────────────────────────────────
@@ -345,6 +506,151 @@ dampSlider.addEventListener('input', () => {
   send({ type: 'setBondedDamping', v });
 });
 
+// ── Seed / reproducibility ─────────────────────────────────────────────────
+function applySeed(): void {
+  const s = Math.max(0, Math.floor(parseFloat(seedInput.value) || 1));
+  seedInput.value = String(s);
+  send({ type: 'setSeed', seed: s });
+  // Reseed implies a fresh sim — wipe stats and burn state on the main side.
+  statsRows.length = 0;
+  updateCsvCount();
+  logStatus(`Seed → ${s} · simulation reset to deterministic initial layout`);
+}
+
+// ── Save / Load ─────────────────────────────────────────────────────────────
+function onSaveState(msg: SaveStateMsg): void {
+  const blob = new Blob([JSON.stringify(msg.state)], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  const tag  = `iter${msg.state.iterations}-seed${msg.state.seed}`;
+  a.href = url;
+  a.download = `primordium-${tag}-${Date.now()}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  logStatus(`Saved · iter ${msg.state.iterations.toLocaleString()} · ${msg.state.cellX.length.toLocaleString()} atoms · ${msg.state.bonds.length / 2} bonds · ${msg.state.dropX.length} droplets`);
+}
+function requestSave(): void {
+  send({ type: 'requestSave' });
+  logStatus('Preparing save…');
+}
+
+const loadFileInput = document.createElement('input');
+loadFileInput.type = 'file';
+loadFileInput.accept = 'application/json,.json';
+loadFileInput.style.display = 'none';
+document.body.appendChild(loadFileInput);
+loadFileInput.addEventListener('change', async () => {
+  const file = loadFileInput.files?.[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const state = JSON.parse(text) as SaveState;
+    if (state.magic !== 'primordium-save') {
+      logStatus(`Load failed: not a Primordium save file (${file.name})`);
+      loadFileInput.value = '';
+      return;
+    }
+    send({ type: 'loadSave', state });
+    logStatus(`Loading "${file.name}"…`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'unknown error';
+    logStatus(`Load failed: ${msg}`);
+  }
+  loadFileInput.value = '';
+});
+function pickAndLoad(): void { loadFileInput.click(); }
+
+function onLoadResult(msg: LoadResultMsg): void {
+  if (msg.ok) {
+    statsRows.length = 0;
+    updateCsvCount();
+    if (typeof msg.seed === 'number') seedInput.value = String(msg.seed);
+    logStatus(`Loaded · iter ${(msg.iterations ?? 0).toLocaleString()} · ${(msg.cellCount ?? 0).toLocaleString()} atoms · sim resumed deterministically from saved RNG state`);
+  } else {
+    logStatus(`Load error: ${msg.error ?? 'unknown'}`);
+  }
+}
+
+// ── Telemetry / CSV ────────────────────────────────────────────────────────
+// Sample snapshots into a typed row buffer. Sampling cadence: every Nth
+// snapshot (the worker emits one snapshot per fixed-rate tick = ~60/sec at
+// default speed; sampling 1-of-30 gives ~2 rows/sec, manageable for a CSV).
+type StatsRow = {
+  iter: number;
+  atoms: number;
+  bonded: number;
+  cells: number;          // closed membrane loops
+  meanGeneLen: number;
+  maxGeneLen: number;
+  droplets: number;
+};
+const statsRows: StatsRow[] = [];
+let statsRecording = true;
+const STATS_SAMPLE_EVERY = 30;
+let statsSampleCounter = 0;
+
+function recordStatsRow(snap: SnapshotMsg): void {
+  statsSampleCounter++;
+  if (statsSampleCounter < STATS_SAMPLE_EVERY) return;
+  statsSampleCounter = 0;
+
+  // bonded count
+  let bonded = 0;
+  for (let i = 0; i < snap.atomCount; i++) {
+    if ((snap.atoms[i * STRIDE + 3] | 0) & 1) bonded++;
+  }
+  // loop stats — loops layout: header[0]=count, then per-loop [vertCount, kind, ...verts]
+  const loopCount = snap.loops[0] | 0;
+  let cursor = 1;
+  let totalVerts = 0, maxVerts = 0;
+  for (let li = 0; li < loopCount; li++) {
+    const v = snap.loops[cursor] | 0;
+    cursor += 2 + v;
+    totalVerts += v;
+    if (v > maxVerts) maxVerts = v;
+  }
+  const meanLen = loopCount > 0 ? totalVerts / loopCount : 0;
+  const dropCount = snap.droplets[0] | 0;
+
+  statsRows.push({
+    iter: snap.iterations,
+    atoms: snap.atomCount,
+    bonded,
+    cells: loopCount,
+    meanGeneLen: +meanLen.toFixed(2),
+    maxGeneLen: maxVerts,
+    droplets: dropCount,
+  });
+  // Cap memory — keep at most 100k rows (a long burn could otherwise bloat).
+  if (statsRows.length > 100_000) statsRows.splice(0, statsRows.length - 100_000);
+  updateCsvCount();
+}
+function updateCsvCount(): void {
+  csvCount.textContent = `${statsRows.length.toLocaleString()} rows`;
+}
+function downloadCSV(): void {
+  if (statsRows.length === 0) { logStatus('No stats recorded yet — let the sim run first'); return; }
+  const header = 'iteration,atoms,bonded_atoms,cells,mean_gene_length,max_gene_length,droplets';
+  const lines: string[] = [header];
+  for (const r of statsRows) {
+    lines.push(`${r.iter},${r.atoms},${r.bonded},${r.cells},${r.meanGeneLen},${r.maxGeneLen},${r.droplets}`);
+  }
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url;
+  a.download = `primordium-stats-${Date.now()}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  logStatus(`Exported ${statsRows.length.toLocaleString()} stats rows to CSV`);
+}
+function clearStats(): void {
+  statsRows.length = 0;
+  updateCsvCount();
+  logStatus('Stats buffer cleared');
+}
+updateCsvCount();
+
 // ── Hooks ───────────────────────────────────────────────────────────────────
 pauseBtn.addEventListener('click', togglePause);
 lysinBtn.addEventListener('click', toggleLysin);
@@ -353,6 +659,14 @@ soupBrushBtn.addEventListener('click', () => setBrush('soup'));
 waterBrushBtn.addEventListener('click', () => setBrush('water'));
 clearWaterBtn.addEventListener('click', clearWater);
 gameBtn.addEventListener('click', toggleGame);
+dripBtn.addEventListener('click', toggleDrip);
+burnBtn.addEventListener('click', startBurn);
+seedApplyBtn.addEventListener('click', applySeed);
+seedInput.addEventListener('keydown', (e) => { if (e.code === 'Enter') applySeed(); });
+saveBtn.addEventListener('click', requestSave);
+loadBtn.addEventListener('click', pickAndLoad);
+csvBtn.addEventListener('click', downloadCSV);
+csvClearBtn.addEventListener('click', clearStats);
 recBtn.addEventListener('click', toggleRecording);
 
 document.addEventListener('keydown', (e) => {
@@ -391,13 +705,23 @@ function loop(): void {
       if (snap.gameStatus === 1 || snap.gameStatus === 2) showGameOverlay(snap.gameStatus);
       else hideGameOverlay();
     }
-    if (useGPU) {
+    if (viewMode === 'classic') {
+      // Classic mode renders entirely onto the overlay canvas (which always
+      // has a 2D context, regardless of whether main is WebGPU or 2D). The
+      // overlay's opaque white fill covers whatever the main canvas last had.
+      draw2DClassic(overlayCtx, snap.atoms, snap.atomCount, snap.bonds, snap.droplets, camera);
+    } else if (useGPU) {
       drawGPU(snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
+      // Reset the overlay transform before clearing — clearRect honors the
+      // current transform, so leftover camera scale from classic-mode would
+      // cause it to clear only a tiny world-space rect and leave the rest
+      // of the overlay frozen on top of the live render beneath.
+      overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
       overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
-      if (!bacteriaView) drawHUD2D(overlayCtx, snap.iterations, snap.atomCount, snap.atoms);
+      if (viewMode === 'educational') drawHUD2D(overlayCtx, snap.iterations, snap.atomCount, snap.atoms);
     } else if (ctx2d) {
       draw2D(ctx2d, snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
-      if (!bacteriaView) {
+      if (viewMode === 'educational') {
         // HUD always in screen space — reset transform first
         ctx2d.setTransform(1, 0, 0, 1, 0, 0);
         drawHUD2D(ctx2d, snap.iterations, snap.atomCount, snap.atoms);

@@ -15,8 +15,7 @@ const COLORS: Record<string, string> = {
 };
 
 const LEGEND: { color: string; label: string; isLine?: boolean }[] = [
-  { color: '#c8a800', label: 'a  prey membrane (bond line)',     isLine: true },
-  { color: '#c81e00', label: 'a  predator membrane (bond line)', isLine: true },
+  { color: '#c8a800', label: 'a  membrane (bond line)', isLine: true },
   { color: '#888888', label: 'b  genome base' },
   { color: '#00dddd', label: 'c  genome base' },
   { color: '#3366ff', label: 'd  enzyme (mid-walk = bouncing)' },
@@ -564,6 +563,107 @@ export function draw2D(
       ctx.fill();
     }
   }
+}
+
+// ── Classic view (Hutton's 2002/2007 aesthetic) ────────────────────────────
+// Renders atoms as pixel-aligned filled squares, bonds as thin straight gray
+// lines, on a white background. No bezier curves on membranes — the membrane
+// outline is just the chain of `a`-`a` bond lines, exactly as in the original.
+// Free state-0 atoms render at low alpha so the eye separates "active
+// chemistry" (bonded / charged) from "background soup."
+//
+// Drawn into the OVERLAY canvas so it works regardless of whether the main
+// canvas is using WebGPU or Canvas 2D. The overlay is opaque white and sits
+// on top of whatever the main canvas last rendered.
+const CLASSIC_COLORS: Record<string, string> = {
+  a: '#c8a800', b: '#888888', c: '#00dddd', d: '#3366ff',
+  e: '#ff3333', f: '#33ff33', p: '#ff7700',
+};
+
+export function draw2DClassic(
+  ctx: CanvasRenderingContext2D,
+  atoms: Float32Array,
+  atomCount: number,
+  bonds: Uint32Array,
+  droplets: Float32Array,
+  camera: Camera,
+): void {
+  const { canvas } = ctx;
+
+  // Opaque white background covers whatever the main canvas had.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // World→screen camera transform, same convention as draw2D.
+  const z = camera.zoom;
+  ctx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+
+  // Faint water droplet hint — Primordium-only feature, kept very subtle so
+  // the classic look stays close to Hutton's. Set to 0 alpha if you want
+  // perfect Hutton fidelity.
+  const dropCount = droplets[0] | 0;
+  ctx.fillStyle = 'rgba(190, 215, 235, 0.18)';
+  for (let i = 0; i < dropCount; i++) {
+    const dx = droplets[1 + i * 3];
+    const dy = droplets[2 + i * 3];
+    const dr = droplets[3 + i * 3];
+    ctx.beginPath();
+    ctx.arc(dx, dy, dr, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Bonds — thin straight lines between bonded atom centers. Single batched
+  // path for performance. lineWidth scales inversely with zoom so it stays
+  // ~1px on screen regardless of zoom level.
+  const bondCount = bonds[0] | 0;
+  ctx.strokeStyle = 'rgba(60, 60, 60, 0.55)';
+  ctx.lineWidth = Math.max(0.4, 0.8 / z);
+  ctx.beginPath();
+  for (let bi = 0; bi < bondCount; bi++) {
+    const i = bonds[1 + bi * 2];
+    const j = bonds[1 + bi * 2 + 1];
+    const oi = i * STRIDE;
+    const oj = j * STRIDE;
+    ctx.moveTo(atoms[oi + 0], atoms[oi + 1]);
+    ctx.lineTo(atoms[oj + 0], atoms[oj + 1]);
+  }
+  ctx.stroke();
+
+  // Atoms as squares. Two passes (faint soup first, solid foreground second)
+  // so we set globalAlpha exactly twice instead of per-atom.
+  const sq = RADIUS * 1.5;
+  const half = sq / 2;
+
+  // Pass 1: free state-0 atoms (soup) — faint pastel squares.
+  ctx.globalAlpha = 0.22;
+  for (let i = 0; i < atomCount; i++) {
+    const o = i * STRIDE;
+    const flags = atoms[o + 3] | 0;
+    const isBonded = (flags & 1) !== 0;
+    if (isBonded) continue;
+    const packed = atoms[o + 2];
+    const state = unpackState(packed);
+    if (state !== 0) continue;
+    const type = String.fromCharCode(unpackType(packed));
+    ctx.fillStyle = CLASSIC_COLORS[type] || '#444444';
+    ctx.fillRect(atoms[o + 0] - half, atoms[o + 1] - half, sq, sq);
+  }
+
+  // Pass 2: bonded or active atoms — solid squares (the visually "alive" set).
+  ctx.globalAlpha = 1;
+  for (let i = 0; i < atomCount; i++) {
+    const o = i * STRIDE;
+    const flags = atoms[o + 3] | 0;
+    const isBonded = (flags & 1) !== 0;
+    const packed = atoms[o + 2];
+    const state = unpackState(packed);
+    if (!isBonded && state === 0) continue;
+    const type = String.fromCharCode(unpackType(packed));
+    ctx.fillStyle = CLASSIC_COLORS[type] || '#444444';
+    ctx.fillRect(atoms[o + 0] - half, atoms[o + 1] - half, sq, sq);
+  }
+  ctx.globalAlpha = 1;
 }
 
 export function drawHUD2D(ctx: CanvasRenderingContext2D, iterations: number, atomCount: number, atoms: Float32Array): void {
