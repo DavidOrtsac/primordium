@@ -77,6 +77,13 @@ let dripWaterInterval = 4250;
 // so abort/paint/etc. can still be processed.
 let burning = false;
 let burnTarget = 0;
+// Click-to-select tool. Main thread sends a world-space coordinate; we pin
+// the closest Cell as a stable reference (Cell objects survive across ticks
+// even as snapshot indices shift). Each snapshot sets flag bit 4 on the
+// selected atom so the main thread knows which one to highlight. Cleared
+// whenever the grid is rebuilt (init / setSeed / setupGame / loadSaveState)
+// since the Cell pointer would otherwise be stale.
+let selectedCell: Cell | null = null;
 const SOUP_RESPAWN_INTERVAL   = 700;   // ticks between soup waves
 const SOUP_RESPAWN_PATCHES    = 5;
 const SOUP_RESPAWN_PER_PATCH  = 90;    // 5 × 90 = 450 atoms per wave
@@ -141,6 +148,7 @@ function spawnRandomSoupPatches(): void {
 }
 
 function setupGame(): void {
+  selectedCell = null;
   grid = new Grid();
   grid.create(gridW, gridH);
   grid.getChemistry().clear();
@@ -197,6 +205,7 @@ function setupGame(): void {
 }
 
 function setupRigged(): void {
+  selectedCell = null;
   grid = new Grid();
   grid.create(gridW, gridH);
   grid.getChemistry().clear();
@@ -215,6 +224,7 @@ function setupRigged(): void {
 }
 
 function setupWild(): void {
+  selectedCell = null;
   grid = new Grid();
   grid.create(gridW, gridH);
   initWild(grid, WILD_ATOM_COUNT);
@@ -382,6 +392,7 @@ function packSnapshot(atomsBuf: Float32Array, loopsBuf: Uint32Array, bondsBuf: U
     if (c.type === 'a' && c.state >= Q) flags |= 2;
     if (c.type === 'a') flags |= 4;
     if (c.playerControlled) flags |= 8;
+    if (c === selectedCell) flags |= 16; // bit 4 = selected, drives the halo on the main thread
     atomsBuf[o + 3] = flags;
   }
 
@@ -562,6 +573,7 @@ function loadSaveState(s: SaveState): string | null {
   noEnemyStartIter = -1;
   burning = false;
   burnTarget = 0;
+  selectedCell = null;
   return null;
 }
 
@@ -802,6 +814,29 @@ self.onmessage = (e: MessageEvent<unknown>) => {
     case 'abortBurn':
       // Flips the loop guard; the loop notices on its next CHUNK boundary.
       burning = false;
+      return;
+    case 'selectAt': {
+      // Find the closest cell within radius. If none, clear selection.
+      const candidates = grid.getAllWithinRadius(msg.x, msg.y, msg.radius);
+      let best: Cell | null = null;
+      let bestD2 = Infinity;
+      for (const c of candidates) {
+        const dx = c.loc.x - msg.x;
+        const dy = c.loc.y - msg.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = c; }
+      }
+      selectedCell = best;
+      return;
+    }
+    case 'deselectAll':
+      selectedCell = null;
+      return;
+    case 'deleteSelected':
+      if (selectedCell) {
+        grid.removeCell(selectedCell);
+        selectedCell = null;
+      }
       return;
     case 'reuse':
       atomsPool.push(msg.atoms);

@@ -70,6 +70,11 @@ function applyBrushAt(clientX: number, clientY: number): void {
     send({ type: 'paintSoup', x: w.x, y: w.y, radius: SOUP_BRUSH_RADIUS, count: SOUP_BRUSH_RATE });
   } else if (brushMode === 'water') {
     send({ type: 'paintWater', x: w.x, y: w.y, radius: WATER_BRUSH_RADIUS });
+  } else if (brushMode === 'select') {
+    // Pick the closest atom within 30 world units of the click. Worker pins
+    // a stable Cell reference; subsequent snapshots flag that atom so the
+    // halo follows it as it moves.
+    send({ type: 'selectAt', x: w.x, y: w.y, radius: 30 });
   }
 }
 
@@ -156,7 +161,7 @@ worker.onmessage = (e: MessageEvent<WorkerMsg>) => {
 };
 
 // ── State (UI-only) ─────────────────────────────────────────────────────────
-type Brush = 'pan' | 'soup' | 'water';
+type Brush = 'pan' | 'soup' | 'water' | 'select';
 type ViewMode = 'educational' | 'microscope' | 'classic';
 let brushMode: Brush = 'pan';
 let paused = false;
@@ -215,6 +220,7 @@ const recBtn         = document.getElementById('rec-btn')        as HTMLButtonEl
 const viewBtn        = document.getElementById('view-btn')       as HTMLButtonElement;
 const soupBrushBtn   = document.getElementById('soup-brush-btn') as HTMLButtonElement;
 const waterBrushBtn  = document.getElementById('water-brush-btn') as HTMLButtonElement;
+const selectBtn      = document.getElementById('select-btn')      as HTMLButtonElement;
 const clearWaterBtn  = document.getElementById('clear-water-btn') as HTMLButtonElement;
 const gameBtn        = document.getElementById('game-btn')        as HTMLButtonElement;
 const dripBtn        = document.getElementById('drip-btn')        as HTMLButtonElement;
@@ -279,11 +285,15 @@ function setBrush(next: Brush): void {
   brushMode = brushMode === next ? 'pan' : next;
   soupBrushBtn.classList.toggle('active', brushMode === 'soup');
   waterBrushBtn.classList.toggle('active', brushMode === 'water');
+  selectBtn.classList.toggle('active', brushMode === 'select');
   canvas.style.cursor = brushMode === 'pan' ? 'grab' : 'crosshair';
+  // Leaving select mode → drop any current selection so the halo disappears.
+  if (prev === 'select' && brushMode !== 'select') send({ type: 'deselectAll' });
   if (prev !== brushMode) {
-    if (brushMode === 'pan')   logStatus('Brush off — drag pans the camera');
-    if (brushMode === 'soup')  logStatus('Soup brush ON — click & drag to seed atoms');
-    if (brushMode === 'water') logStatus('Water brush ON — click to drop water (touching droplets fuse)');
+    if (brushMode === 'pan')    logStatus('Brush off — drag pans the camera');
+    if (brushMode === 'soup')   logStatus('Soup brush ON — click & drag to seed atoms');
+    if (brushMode === 'water')  logStatus('Water brush ON — click to drop water (touching droplets fuse)');
+    if (brushMode === 'select') logStatus('Select ON — click an atom to highlight it · Delete/Backspace removes it');
   }
 }
 function clearWater(): void {
@@ -657,6 +667,7 @@ lysinBtn.addEventListener('click', toggleLysin);
 viewBtn.addEventListener('click', toggleView);
 soupBrushBtn.addEventListener('click', () => setBrush('soup'));
 waterBrushBtn.addEventListener('click', () => setBrush('water'));
+selectBtn.addEventListener('click', () => setBrush('select'));
 clearWaterBtn.addEventListener('click', clearWater);
 gameBtn.addEventListener('click', toggleGame);
 dripBtn.addEventListener('click', toggleDrip);
@@ -688,6 +699,11 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'KeyV')  { toggleView(); }
   if (e.code === 'KeyG')  { toggleGame(); }
   if (e.code === 'Escape') { setBrush('pan'); }
+  if ((e.code === 'Delete' || e.code === 'Backspace') && brushMode === 'select') {
+    e.preventDefault();
+    send({ type: 'deleteSelected' });
+    logStatus('Selected atom deleted — observe the cell\'s response');
+  }
 });
 document.addEventListener('keyup', (e) => {
   if (!gameMode) return;
@@ -727,9 +743,66 @@ function loop(): void {
         drawHUD2D(ctx2d, snap.iterations, snap.atomCount, snap.atoms);
       }
     }
+    // Selection halo — draws the yellow ring on whichever surface is
+    // currently visible (overlay for GPU/Classic, main for 2D), so the
+    // highlighted atom is always visible regardless of view mode.
+    drawSelectionHalo(snap);
   }
   // also keep stepsPerFrame in sync (so worker has it after init)
   void stepsPerFrame;
   requestAnimationFrame(loop);
+}
+
+// Find the selected atom (flag bit 4) and draw a halo at its current
+// world position. Drawn on whichever 2D context is currently on top:
+//   • Classic view  → overlay (already opaque)
+//   • GPU view      → overlay (sits over the GPU canvas)
+//   • 2D view       → main ctx2d (since the overlay is empty/cleared)
+//   • Microscope    → overlay (and we force-unhide it below)
+function drawSelectionHalo(snap: SnapshotMsg): void {
+  // Find the selected atom in this snapshot. There's at most one.
+  let sx = -1, sy = -1;
+  for (let i = 0; i < snap.atomCount; i++) {
+    const flags = snap.atoms[i * STRIDE + 3] | 0;
+    if (flags & 16) {
+      sx = snap.atoms[i * STRIDE + 0];
+      sy = snap.atoms[i * STRIDE + 1];
+      break;
+    }
+  }
+  // If hidden by microscope CSS, force-unhide so the halo is visible during selection.
+  const microscope = viewMode === 'microscope';
+  if (microscope) {
+    overlay.classList.toggle('hidden', sx < 0); // hidden when nothing selected
+  }
+  if (sx < 0) return;
+
+  // Pick the right context. In the pure-2D view the overlay is empty and the
+  // main ctx2d holds the world; everywhere else the overlay sits on top.
+  const useOverlay = viewMode !== 'educational' || useGPU || microscope;
+  const ctx = useOverlay ? overlayCtx : ctx2d;
+  if (!ctx) return;
+
+  // World→screen camera transform, same convention as the renderers.
+  const z = camera.zoom;
+  ctx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+
+  // Pulsing yellow halo. Period ~1.2s. Phase from wallclock so it animates
+  // even if the sim is paused.
+  const t = (performance.now() / 1000) * 2 * Math.PI / 1.2;
+  const pulse = 0.6 + 0.4 * (Math.sin(t) * 0.5 + 0.5);
+  ctx.lineWidth = Math.max(1.0, 2.5 / z);
+  ctx.strokeStyle = `rgba(255, 220, 60, ${pulse.toFixed(3)})`;
+  ctx.beginPath();
+  ctx.arc(sx, sy, 14, 0, Math.PI * 2);
+  ctx.stroke();
+  // Inner crosshair so the user can see the exact center even at low zoom.
+  ctx.strokeStyle = `rgba(255, 240, 120, ${(pulse * 0.7).toFixed(3)})`;
+  ctx.lineWidth = Math.max(0.6, 1.0 / z);
+  ctx.beginPath();
+  ctx.moveTo(sx - 8, sy); ctx.lineTo(sx + 8, sy);
+  ctx.moveTo(sx, sy - 8); ctx.lineTo(sx, sy + 8);
+  ctx.stroke();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
 }
 requestAnimationFrame(loop);

@@ -58,6 +58,9 @@ export type ControlMsg =
   | { type: 'setSeed'; seed: number }
   | { type: 'requestSave' }
   | { type: 'loadSave'; state: SaveState }
+  | { type: 'selectAt'; x: number; y: number; radius: number }
+  | { type: 'deselectAll' }
+  | { type: 'deleteSelected' }
   | { type: 'reuse'; atoms: Float32Array; loops: Uint32Array; bonds: Uint32Array; droplets: Float32Array };
 
 // Serialized full simulation state for save/load round-trip. Designed so

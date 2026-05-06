@@ -99,6 +99,26 @@ export class Grid {
     return cell;
   }
 
+  // Surgical removal: yank a single atom out of the simulation. Used by the
+  // "select + delete" tool. Breaks all bonds first so partners drop their
+  // reference, then unlinks from spatial slot and main cells array via
+  // swap-pop on both.
+  removeCell(cell: Cell): void {
+    cell.breakAllBonds();
+    const [sx, sy] = this.slotOf(cell.loc.x, cell.loc.y);
+    const slot = this.slots[sx][sy];
+    const sIdx = slot.indexOf(cell);
+    if (sIdx >= 0) {
+      slot[sIdx] = slot[slot.length - 1];
+      slot.pop();
+    }
+    const cIdx = this.cells.indexOf(cell);
+    if (cIdx >= 0) {
+      this.cells[cIdx] = this.cells[this.cells.length - 1];
+      this.cells.pop();
+    }
+  }
+
   step(): void {
     this.computeVelocitiesAndReact();
     this.moveCells();
