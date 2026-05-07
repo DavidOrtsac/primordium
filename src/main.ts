@@ -201,17 +201,22 @@ canvas.addEventListener('touchstart', (e: TouchEvent) => {
 
 canvas.addEventListener('touchmove', (e: TouchEvent) => {
   if (activeGesture === 'pinch' && e.touches.length === 2) {
-    // Pinch-zoom around the original midpoint so the two fingers stay
-    // anchored to the world points they grabbed at gesture start.
+    // Two-finger gesture: pinch zoom AND pan together. The world point
+    // originally grabbed at the midpoint stays glued to the *current*
+    // midpoint, so moving both fingers translates the camera while
+    // spreading them zooms — same anchor for both.
     const newDist = touchDist(e.touches[0], e.touches[1]);
+    const newMidCanvas = clientToCanvas(
+      (e.touches[0].clientX + e.touches[1].clientX) / 2,
+      (e.touches[0].clientY + e.touches[1].clientY) / 2,
+    );
     if (pinchStartDist > 0 && newDist > 0) {
       const scale = newDist / pinchStartDist;
       const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, pinchStartZoom * scale));
-      // Both pinchStartMidX/Y and the formula are in canvas-internal pixels.
       const worldX = pinchStartMidX / pinchStartZoom + pinchStartCamX;
       const worldY = pinchStartMidY / pinchStartZoom + pinchStartCamY;
-      camera.x = worldX - pinchStartMidX / newZoom;
-      camera.y = worldY - pinchStartMidY / newZoom;
+      camera.x = worldX - newMidCanvas.x / newZoom;
+      camera.y = worldY - newMidCanvas.y / newZoom;
       camera.zoom = newZoom;
     }
   } else if (activeGesture === 'single' && e.touches.length === 1 && dragging) {
@@ -313,6 +318,14 @@ const WATER_BRUSH_RADIUS = 180;   // world units
 // ── Boot — WebGPU is the default. If the browser doesn't have WebGPU we
 // fall back to the optimized Canvas 2D renderer (also visually 1:1 with the
 // original). Either way physics runs in the worker.
+// Autosave is separate from quicksave: it runs on a timer so the user can
+// close the tab/browser and reopen the page later with their sim restored
+// automatically. Independent localStorage slot so manual quicksaves aren't
+// clobbered. Hoisted here so the startup IIFE below can reference them
+// without tripping TS's "used before declaration" check.
+const AUTOSAVE_KEY = 'primordium-autosave-v1';
+const AUTOSAVE_INTERVAL_MS = 15_000;
+
 (async () => {
   useGPU = await initGPU(canvas);
   if (!useGPU) {
@@ -322,6 +335,33 @@ const WATER_BRUSH_RADIUS = 180;   // world units
     showStatus('WebGPU · physics in worker · larger arena');
   }
   send({ type: 'init', gridW: GRID_W, gridH: GRID_H, mode: 'rigged' });
+  // Autosave restore — if the previous session was saved before close,
+  // load it on top of the fresh init. Skipped silently if absent or
+  // corrupt; the user just gets a default sim in that case.
+  try {
+    const raw = localStorage.getItem(AUTOSAVE_KEY);
+    if (raw) {
+      const state = JSON.parse(raw) as SaveState;
+      if (state && state.magic === 'primordium-save') {
+        send({ type: 'loadSave', state });
+        logStatus(`⏪ Restored your previous session · iter ${state.iterations.toLocaleString()} · seed ${state.seed}`);
+      }
+    }
+  } catch { /* malformed autosave — ignore and keep fresh sim */ }
+  // Periodic autosave so a closed/reloaded tab returns to nearly the
+  // same state. Skipped while paused (no progress to lose).
+  setInterval(() => {
+    if (!paused) requestAutosave();
+  }, AUTOSAVE_INTERVAL_MS);
+  // Flush an autosave whenever the tab is hidden or about to unload.
+  // pagehide is the most reliable cross-browser signal on mobile —
+  // visibilitychange covers tab switches; both call requestAutosave so
+  // the next snapshot persists. Best-effort: if the worker doesn't
+  // respond before the page dies, the prior periodic save still wins.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && !paused) requestAutosave();
+  });
+  window.addEventListener('pagehide', () => { if (!paused) requestAutosave(); });
 })();
 
 // Status line — central log surface. logStatus() is the action-feedback
@@ -368,6 +408,7 @@ const seedInput       = document.getElementById('seed-input')      as HTMLInputE
 const seedApplyBtn    = document.getElementById('seed-apply-btn')  as HTMLButtonElement;
 const saveBtn         = document.getElementById('save-btn')        as HTMLButtonElement;
 const loadBtn         = document.getElementById('load-btn')        as HTMLButtonElement;
+const resetBtn        = document.getElementById('reset-btn')       as HTMLButtonElement | null;
 const csvBtn          = document.getElementById('csv-btn')         as HTMLButtonElement;
 const csvClearBtn     = document.getElementById('csv-clear-btn')   as HTMLButtonElement;
 const csvCount        = document.getElementById('csv-count')!;
@@ -686,7 +727,7 @@ function applySeed(): void {
 // a notable change like toggling noise). The worker doesn't know which is
 // which — it just produces a SaveState. The reason queue is FIFO so
 // requests are matched in order.
-type SaveReason = 'download' | 'quicksave' | 'snapshot';
+type SaveReason = 'download' | 'quicksave' | 'snapshot' | 'autosave';
 const _saveReasons: { reason: SaveReason; label?: string }[] = [];
 
 // Quicksave / quickload — single in-memory slot, persists to localStorage
@@ -732,7 +773,22 @@ function onSaveState(msg: SaveStateMsg): void {
     snapshotRing.push({ state: msg.state, label: job.label ?? 'auto', capturedAt: Date.now() });
     while (snapshotRing.length > SNAPSHOT_RING_MAX) snapshotRing.shift();
     // Quiet entry — don't flash status for every auto-snapshot.
+    return;
   }
+  if (job.reason === 'autosave') {
+    try { localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(msg.state)); }
+    catch { /* quota / private mode — silent, autosave is best-effort */ }
+    return;
+  }
+}
+function requestAutosave(): void {
+  // Avoid stacking pending autosaves if the worker is slow.
+  for (const j of _saveReasons) { if (j.reason === 'autosave') return; }
+  _saveReasons.push({ reason: 'autosave' });
+  send({ type: 'requestSave' });
+}
+function clearAutosave(): void {
+  try { localStorage.removeItem(AUTOSAVE_KEY); } catch { /* ignore */ }
 }
 function requestSave(): void {
   _saveReasons.push({ reason: 'download' });
@@ -1122,6 +1178,20 @@ seedApplyBtn.addEventListener('click', applySeed);
 seedInput.addEventListener('keydown', (e) => { if (e.code === 'Enter') applySeed(); });
 saveBtn.addEventListener('click', requestSave);
 loadBtn.addEventListener('click', pickAndLoad);
+if (resetBtn) {
+  resetBtn.addEventListener('click', () => {
+    const ok = window.confirm(
+      'Reset the simulation?\n\nThis will wipe the current arena, clear your auto-saved progress, and start a fresh sim. This cannot be undone (use Save first if you want to keep this run).',
+    );
+    if (!ok) return;
+    clearAutosave();
+    statsRows.length = 0;
+    updateCsvCount();
+    snapshotRing.length = 0;
+    send({ type: 'init', gridW: GRID_W, gridH: GRID_H, mode: 'rigged' });
+    logStatus('♻️ Simulation reset — fresh arena, autosave cleared');
+  });
+}
 csvBtn.addEventListener('click', downloadCSV);
 csvClearBtn.addEventListener('click', clearStats);
 noiseBtn.addEventListener('click', toggleNoise);
