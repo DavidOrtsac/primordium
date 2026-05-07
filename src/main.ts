@@ -14,7 +14,7 @@
 //
 // No physics state lives here.
 
-import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, SaveState, STRIDE } from './snapshot';
+import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, SaveState, STRIDE } from './snapshot';
 import { draw2D, draw2DClassic, drawHUD2D } from './renderer-2d';
 import { initGPU, drawGPU } from './renderer-gpu';
 
@@ -139,15 +139,15 @@ function sendTransfer(msg: ControlMsg, transferables: Transferable[]): void {
 // caused a deadlock when the worker only had 2 buffers in its pool).
 let lastSnapshot: SnapshotMsg | null = null;
 
-type WorkerMsg = SnapshotMsg | BurnProgressMsg | BurnDoneMsg | SaveStateMsg | LoadResultMsg;
+type WorkerMsg = SnapshotMsg | BurnProgressMsg | BurnDoneMsg | SaveStateMsg | LoadResultMsg | EventLogChunkMsg;
 
 worker.onmessage = (e: MessageEvent<WorkerMsg>) => {
   const data = e.data;
   if (data.type === 'snapshot') {
     if (lastSnapshot) {
       sendTransfer(
-        { type: 'reuse', atoms: lastSnapshot.atoms, loops: lastSnapshot.loops, bonds: lastSnapshot.bonds, droplets: lastSnapshot.droplets },
-        [lastSnapshot.atoms.buffer, lastSnapshot.loops.buffer, lastSnapshot.bonds.buffer, lastSnapshot.droplets.buffer],
+        { type: 'reuse', atoms: lastSnapshot.atoms, atomIds: lastSnapshot.atomIds, loops: lastSnapshot.loops, bonds: lastSnapshot.bonds, droplets: lastSnapshot.droplets },
+        [lastSnapshot.atoms.buffer, lastSnapshot.atomIds.buffer, lastSnapshot.loops.buffer, lastSnapshot.bonds.buffer, lastSnapshot.droplets.buffer],
       );
     }
     lastSnapshot = data;
@@ -158,6 +158,7 @@ worker.onmessage = (e: MessageEvent<WorkerMsg>) => {
   if (data.type === 'burnDone')     { onBurnDone(data);     return; }
   if (data.type === 'saveState')    { onSaveState(data);    return; }
   if (data.type === 'loadResult')   { onLoadResult(data);   return; }
+  if (data.type === 'eventLogChunk'){ onEventLogChunk(data); return; }
 };
 
 // ── State (UI-only) ─────────────────────────────────────────────────────────
@@ -238,6 +239,23 @@ const loadBtn         = document.getElementById('load-btn')        as HTMLButton
 const csvBtn          = document.getElementById('csv-btn')         as HTMLButtonElement;
 const csvClearBtn     = document.getElementById('csv-clear-btn')   as HTMLButtonElement;
 const csvCount        = document.getElementById('csv-count')!;
+const noiseBtn        = document.getElementById('noise-btn')         as HTMLButtonElement;
+const noiseSlidersRow = document.getElementById('noise-sliders')     as HTMLSpanElement;
+const noiseCopySlider  = document.getElementById('noise-copy-slider')  as HTMLInputElement;
+const noiseDecaySlider = document.getElementById('noise-decay-slider') as HTMLInputElement;
+const noiseBondSlider  = document.getElementById('noise-bond-slider')  as HTMLInputElement;
+const noiseCopyVal     = document.getElementById('noise-copy-val')!;
+const noiseDecayVal    = document.getElementById('noise-decay-val')!;
+const noiseBondVal     = document.getElementById('noise-bond-val')!;
+const eventsDlBtn      = document.getElementById('events-dl-btn')      as HTMLButtonElement;
+const eventsClearBtn   = document.getElementById('events-clear-btn')   as HTMLButtonElement;
+const eventsCount      = document.getElementById('events-count')!;
+const hydroBtn          = document.getElementById('hydro-btn')           as HTMLButtonElement;
+const hydroSlidersRow   = document.getElementById('hydro-sliders')       as HTMLSpanElement;
+const hydroRateSlider   = document.getElementById('hydro-rate-slider')   as HTMLInputElement;
+const hydroDensitySlider= document.getElementById('hydro-density-slider')as HTMLInputElement;
+const hydroRateVal      = document.getElementById('hydro-rate-val')!;
+const hydroDensityVal   = document.getElementById('hydro-density-val')!;
 const scopeFrame     = document.getElementById('scope-frame')    as HTMLDivElement;
 
 function togglePause(): void {
@@ -528,20 +546,104 @@ function applySeed(): void {
 }
 
 // ── Save / Load ─────────────────────────────────────────────────────────────
+// Save flow now multiplexes by reason: 'download' (existing), 'quicksave'
+// (in-memory slot, no file), or 'snapshot' (auto-captured to ring before
+// a notable change like toggling noise). The worker doesn't know which is
+// which — it just produces a SaveState. The reason queue is FIFO so
+// requests are matched in order.
+type SaveReason = 'download' | 'quicksave' | 'snapshot';
+const _saveReasons: { reason: SaveReason; label?: string }[] = [];
+
+// Quicksave / quickload — single in-memory slot, persists to localStorage
+// so it survives page reloads. Hotkeys: [ saves, ] loads. No file dialog.
+const QUICKSAVE_KEY = 'primordium-quicksave-v1';
+let quicksaveSlot: SaveState | null = (() => {
+  try {
+    const raw = localStorage.getItem(QUICKSAVE_KEY);
+    return raw ? JSON.parse(raw) as SaveState : null;
+  } catch { return null; }
+})();
+
+// Snapshot ring — auto-captures state before each notable toggle (noise on/off,
+// hydrolysis on/off, big slider changes). Up to 5 entries, oldest first dropped.
+const SNAPSHOT_RING_MAX = 5;
+const snapshotRing: { state: SaveState; label: string; capturedAt: number }[] = [];
+
 function onSaveState(msg: SaveStateMsg): void {
-  const blob = new Blob([JSON.stringify(msg.state)], { type: 'application/json' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  const tag  = `iter${msg.state.iterations}-seed${msg.state.seed}`;
-  a.href = url;
-  a.download = `primordium-${tag}-${Date.now()}.json`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 10_000);
-  logStatus(`Saved · iter ${msg.state.iterations.toLocaleString()} · ${msg.state.cellX.length.toLocaleString()} atoms · ${msg.state.bonds.length / 2} bonds · ${msg.state.dropX.length} droplets`);
+  const job = _saveReasons.shift() ?? { reason: 'download' as SaveReason };
+  if (job.reason === 'download') {
+    const blob = new Blob([JSON.stringify(msg.state)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    const tag  = `iter${msg.state.iterations}-seed${msg.state.seed}`;
+    a.href = url;
+    a.download = `primordium-${tag}-${Date.now()}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    logStatus(`Saved · iter ${msg.state.iterations.toLocaleString()} · ${msg.state.cellX.length.toLocaleString()} atoms · ${msg.state.bonds.length / 2} bonds · ${msg.state.dropX.length} droplets`);
+    return;
+  }
+  if (job.reason === 'quicksave') {
+    quicksaveSlot = msg.state;
+    try { localStorage.setItem(QUICKSAVE_KEY, JSON.stringify(msg.state)); }
+    catch (err: unknown) {
+      const m = err instanceof Error ? err.message : 'unknown';
+      logStatus(`Quicksave warning: localStorage failed (${m}) — slot kept in memory only`);
+    }
+    logStatus(`⚡ Quicksaved · iter ${msg.state.iterations.toLocaleString()} · press ] to restore`);
+    return;
+  }
+  if (job.reason === 'snapshot') {
+    snapshotRing.push({ state: msg.state, label: job.label ?? 'auto', capturedAt: Date.now() });
+    while (snapshotRing.length > SNAPSHOT_RING_MAX) snapshotRing.shift();
+    // Quiet entry — don't flash status for every auto-snapshot.
+  }
 }
 function requestSave(): void {
+  _saveReasons.push({ reason: 'download' });
   send({ type: 'requestSave' });
   logStatus('Preparing save…');
+}
+function quickSave(): void {
+  _saveReasons.push({ reason: 'quicksave' });
+  send({ type: 'requestSave' });
+}
+function quickLoad(): void {
+  if (!quicksaveSlot) {
+    logStatus('No quicksave to restore — press [ first to save current state');
+    return;
+  }
+  send({ type: 'loadSave', state: quicksaveSlot });
+  logStatus(`⏪ Quickload · iter ${quicksaveSlot.iterations.toLocaleString()} · seed ${quicksaveSlot.seed}`);
+}
+function captureAutoSnapshot(label: string): void {
+  _saveReasons.push({ reason: 'snapshot', label });
+  send({ type: 'requestSave' });
+}
+// Freeze — the panic button. Pause the sim, zero all noise sliders (without
+// losing their slider positions), and quicksave. One key for "I see something
+// interesting, capture it now and stop the world from changing."
+function freezeAndCapture(): void {
+  if (!paused) { paused = true; pauseBtn.textContent = 'Resume'; send({ type: 'pause', paused: true }); }
+  // Zero noise without changing slider positions — just push a state with
+  // all rates clamped to 0. Toggling noise off entirely would break the
+  // user's slider settings. Restoring is just toggling noise back on.
+  if (noiseOn) {
+    noiseOn = false;
+    noiseBtn.textContent = '🧬 Noise: OFF';
+    noiseBtn.classList.toggle('active', false);
+    noiseSlidersRow.classList.toggle('shown', false);
+    pushNoiseState();
+  }
+  if (hydroOn) {
+    hydroOn = false;
+    hydroBtn.textContent = '💧🧪 Hydrolysis: OFF';
+    hydroBtn.classList.toggle('active', false);
+    hydroSlidersRow.classList.toggle('shown', false);
+    pushHydroState();
+  }
+  quickSave();
+  logStatus('🧊 FREEZE — paused, all noise/hydrolysis off, quicksaved. Press F to resume + reload settings.');
 }
 
 const loadFileInput = document.createElement('input');
@@ -661,6 +763,215 @@ function clearStats(): void {
 }
 updateCsvCount();
 
+// ── Noise + event log ─────────────────────────────────────────────────────
+// Slider values are 0..1000 representing log-spaced probability 0..1e-2.
+// 0 → 0.0, 1000 → 1e-2. We use log scale because the interesting regimes
+// (1e-5 .. 1e-3) span four orders of magnitude — a linear slider would
+// crowd them all into the bottom 1% of travel.
+function sliderToProb(v: number): number {
+  if (v <= 0) return 0;
+  // Map [1, 1000] log-space → [1e-6, 1e-2]
+  const t = v / 1000;
+  return Math.pow(10, -6 + 4 * t);
+}
+function fmtProb(p: number): string {
+  if (p <= 0) return '0';
+  if (p >= 1e-3) return p.toExponential(1);
+  return p.toExponential(0);
+}
+
+let noiseOn = false;
+function pushNoiseState(): void {
+  // When OFF, hard-zero everything regardless of slider positions so
+  // reproducibility is never accidentally broken by a stray slider value.
+  if (!noiseOn) {
+    send({ type: 'setNoise', enabled: false, copyFidelity: 0, decayRate: 0, bondFailRate: 0 });
+    return;
+  }
+  send({
+    type: 'setNoise',
+    enabled: true,
+    copyFidelity: sliderToProb(parseInt(noiseCopySlider.value)  || 0),
+    decayRate:    sliderToProb(parseInt(noiseDecaySlider.value) || 0),
+    bondFailRate: sliderToProb(parseInt(noiseBondSlider.value)  || 0),
+  });
+}
+function refreshNoiseLabels(): void {
+  noiseCopyVal.textContent  = fmtProb(sliderToProb(parseInt(noiseCopySlider.value)  || 0));
+  noiseDecayVal.textContent = fmtProb(sliderToProb(parseInt(noiseDecaySlider.value) || 0));
+  noiseBondVal.textContent  = fmtProb(sliderToProb(parseInt(noiseBondSlider.value)  || 0));
+}
+function toggleNoise(): void {
+  // Auto-snapshot the pre-toggle state so a one-click rewind is available
+  // if the toggle ruins something interesting.
+  captureAutoSnapshot(noiseOn ? 'before-noise-off' : 'before-noise-on');
+  noiseOn = !noiseOn;
+  noiseBtn.textContent = noiseOn ? '🧬 Noise: ON' : '🧬 Noise: OFF';
+  noiseBtn.classList.toggle('active', noiseOn);
+  noiseSlidersRow.classList.toggle('shown', noiseOn);
+  pushNoiseState();
+  if (noiseOn) {
+    logStatus(`Noise ON — copy ${fmtProb(sliderToProb(+noiseCopySlider.value))} · decay ${fmtProb(sliderToProb(+noiseDecaySlider.value))} · bond ${fmtProb(sliderToProb(+noiseBondSlider.value))}`);
+  } else {
+    logStatus('Noise OFF — chemistry deterministic again');
+  }
+}
+noiseCopySlider.addEventListener('input', () => {
+  refreshNoiseLabels();
+  if (noiseOn) pushNoiseState();
+});
+noiseDecaySlider.addEventListener('input', () => {
+  refreshNoiseLabels();
+  if (noiseOn) pushNoiseState();
+});
+noiseBondSlider.addEventListener('input', () => {
+  refreshNoiseLabels();
+  if (noiseOn) pushNoiseState();
+});
+refreshNoiseLabels();
+
+// Event log accumulator. Worker auto-flushes its 64K-entry ring buffer
+// every snapshot; main concatenates chunks here so the user can download
+// the entire run regardless of buffer wraparound. Capped at 5M events
+// (~80MB in memory, ~120MB CSV) to avoid runaway browser memory growth.
+type EventRow = {
+  iter: number;
+  kind: number;        // 0=copy_misfire, 1=decay, 2=bond_fail, 3=rule_flip
+  atomA: number;
+  atomB: number;
+  before: number;
+  after: number;
+};
+const eventRows: EventRow[] = [];
+let eventTotalEverFired = 0;
+let eventDroppedTotal = 0;
+const EVENT_ROW_CAP = 5_000_000;
+
+function onEventLogChunk(chunk: EventLogChunkMsg): void {
+  for (let i = 0; i < chunk.n; i++) {
+    eventRows.push({
+      iter:   chunk.iters[i],
+      kind:   chunk.kinds[i],
+      atomA:  chunk.atomA[i],
+      atomB:  chunk.atomB[i],
+      before: chunk.before[i],
+      after:  chunk.after[i],
+    });
+  }
+  eventTotalEverFired = chunk.totalEverFired;
+  eventDroppedTotal += chunk.droppedSinceLast;
+  if (eventRows.length > EVENT_ROW_CAP) {
+    eventRows.splice(0, eventRows.length - EVENT_ROW_CAP);
+  }
+  updateEventsCount();
+}
+function updateEventsCount(): void {
+  let label = `${eventRows.length.toLocaleString()} events`;
+  if (eventDroppedTotal > 0) label += ` (+${eventDroppedTotal.toLocaleString()} dropped)`;
+  eventsCount.textContent = label;
+}
+function unpackTypeChar(packed: number): string {
+  return String.fromCharCode((packed >>> 16) & 0xffff);
+}
+function unpackStateNum(packed: number): number {
+  return packed & 0xffff;
+}
+const KIND_NAMES = ['copy_misfire', 'decay', 'bond_fail', 'rule_flip', 'hydrolysis', 'water_used'];
+
+function downloadEventsCSV(): void {
+  // Force-flush any buffered events on the worker first so the download
+  // is current. The chunk arrives async, so we delay ~50ms to let it land.
+  send({ type: 'requestEventLog' });
+  setTimeout(() => {
+    if (eventRows.length === 0) {
+      logStatus('No events recorded — turn on Noise and let the sim run');
+      return;
+    }
+    const header = 'iter,kind,atomA_id,atomB_id,before_type,before_state,after_type,after_state';
+    const lines: string[] = [header];
+    for (const r of eventRows) {
+      const kindName = KIND_NAMES[r.kind] ?? String(r.kind);
+      let bt = '', bs = '', at = '', as = '';
+      if (r.kind === 2) {
+        // Bond events: before/after are 0/1 flags, no type/state.
+        bt = '';     bs = String(r.before);
+        at = '';     as = String(r.after);
+      } else {
+        bt = unpackTypeChar(r.before);
+        bs = String(unpackStateNum(r.before));
+        at = unpackTypeChar(r.after);
+        as = String(unpackStateNum(r.after));
+      }
+      lines.push(`${r.iter},${kindName},${r.atomA},${r.atomB},${bt},${bs},${at},${as}`);
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = `primordium-events-${Date.now()}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    logStatus(`Exported ${eventRows.length.toLocaleString()} events · ${eventTotalEverFired.toLocaleString()} fired total · ${eventDroppedTotal} dropped`);
+  }, 50);
+}
+function clearEvents(): void {
+  eventRows.length = 0;
+  eventDroppedTotal = 0;
+  updateEventsCount();
+  logStatus('Event buffer cleared');
+}
+updateEventsCount();
+
+// ── Hydrolysis (water-driven decomposition) ───────────────────────────────
+// Two parameters: rate multiplier (0.1× to 10× the per-bond-type defaults)
+// and water density (atoms per square grid unit when generating). Toggle
+// gates everything — when OFF, no water is generated and the worker's
+// hydrolysis sweep returns immediately, so the base sim is bit-identical.
+function hydroRateFromSlider(v: number): number {
+  // Slider 0..1000 maps to 0.1× .. 10× on log scale (10^(-1 + 2*t)).
+  const t = v / 1000;
+  return Math.pow(10, -1 + 2 * t);
+}
+function hydroDensityFromSlider(v: number): number {
+  // Slider 1..100 maps linearly to 0.0001 .. 0.01.
+  return v * 1e-4;
+}
+let hydroOn = false;
+function pushHydroState(): void {
+  send({
+    type: 'setHydrolysis',
+    enabled: hydroOn,
+    baseRate:     hydroRateFromSlider(parseInt(hydroRateSlider.value) || 500),
+    waterDensity: hydroDensityFromSlider(parseInt(hydroDensitySlider.value) || 10),
+  });
+}
+function refreshHydroLabels(): void {
+  hydroRateVal.textContent    = hydroRateFromSlider(parseInt(hydroRateSlider.value) || 500).toFixed(2);
+  hydroDensityVal.textContent = hydroDensityFromSlider(parseInt(hydroDensitySlider.value) || 10).toFixed(4);
+}
+function toggleHydro(): void {
+  captureAutoSnapshot(hydroOn ? 'before-hydro-off' : 'before-hydro-on');
+  hydroOn = !hydroOn;
+  hydroBtn.textContent = hydroOn ? '💧🧪 Hydrolysis: ON' : '💧🧪 Hydrolysis: OFF';
+  hydroBtn.classList.toggle('active', hydroOn);
+  hydroSlidersRow.classList.toggle('shown', hydroOn);
+  pushHydroState();
+  if (hydroOn) {
+    logStatus(`Hydrolysis ON — water atoms generated in every droplet, base rate ${hydroRateFromSlider(+hydroRateSlider.value).toFixed(2)}× · density ${hydroDensityFromSlider(+hydroDensitySlider.value).toFixed(4)}`);
+  } else {
+    logStatus('Hydrolysis OFF — water atoms removed, base sim restored');
+  }
+}
+hydroRateSlider.addEventListener('input', () => {
+  refreshHydroLabels();
+  if (hydroOn) pushHydroState();
+});
+hydroDensitySlider.addEventListener('input', () => {
+  refreshHydroLabels();
+  if (hydroOn) pushHydroState();
+});
+refreshHydroLabels();
+
 // ── Hooks ───────────────────────────────────────────────────────────────────
 pauseBtn.addEventListener('click', togglePause);
 lysinBtn.addEventListener('click', toggleLysin);
@@ -678,6 +989,10 @@ saveBtn.addEventListener('click', requestSave);
 loadBtn.addEventListener('click', pickAndLoad);
 csvBtn.addEventListener('click', downloadCSV);
 csvClearBtn.addEventListener('click', clearStats);
+noiseBtn.addEventListener('click', toggleNoise);
+hydroBtn.addEventListener('click', toggleHydro);
+eventsDlBtn.addEventListener('click', downloadEventsCSV);
+eventsClearBtn.addEventListener('click', clearEvents);
 recBtn.addEventListener('click', toggleRecording);
 
 document.addEventListener('keydown', (e) => {
@@ -698,6 +1013,11 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'KeyC')  { clearWater(); }
   if (e.code === 'KeyV')  { toggleView(); }
   if (e.code === 'KeyG')  { toggleGame(); }
+  if (e.code === 'KeyN')  { toggleNoise(); }
+  if (e.code === 'KeyH')  { toggleHydro(); }
+  if (e.code === 'BracketLeft')  { e.preventDefault(); quickSave(); }
+  if (e.code === 'BracketRight') { e.preventDefault(); quickLoad(); }
+  if (e.code === 'KeyF')         { e.preventDefault(); freezeAndCapture(); }
   if (e.code === 'Escape') { setBrush('pan'); }
   if ((e.code === 'Delete' || e.code === 'Backspace') && brushMode === 'select') {
     e.preventDefault();

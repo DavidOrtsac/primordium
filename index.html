@@ -367,6 +367,56 @@
       </div>
     </div>
 
+    <!-- Row 3.6: NOISE PANEL — primitive-level mutation sources. All four
+         sliders independent, all default to zero. Toggle gates the whole
+         panel so reproducibility is preserved when noise is OFF. -->
+    <div class="ctl-row">
+      <div class="ctl-group">
+        <button id="noise-btn">🧬 Noise: OFF</button>
+        <span class="inline-sliders" id="noise-sliders">
+          <label>copy
+            <input type="range" id="noise-copy-slider" min="0" max="1000" value="0" step="1">
+            <span class="val" id="noise-copy-val">0</span>
+          </label>
+          <label>decay
+            <input type="range" id="noise-decay-slider" min="0" max="1000" value="0" step="1">
+            <span class="val" id="noise-decay-val">0</span>
+          </label>
+          <label>bond
+            <input type="range" id="noise-bond-slider" min="0" max="1000" value="0" step="1">
+            <span class="val" id="noise-bond-val">0</span>
+          </label>
+        </span>
+      </div>
+      <div class="ctl-divider"></div>
+      <div class="ctl-group">
+        <span class="ctl-label">📜 events</span>
+        <button id="events-dl-btn">Download CSV</button>
+        <button id="events-clear-btn">Clear</button>
+        <span id="events-count" class="ctl-label">0 events</span>
+      </div>
+    </div>
+
+    <!-- Row 3.7: HYDROLYSIS PANEL — water-driven decomposition. When ON,
+         water atoms ('w') are generated inside droplets and chemically
+         decompose nearby non-protected bonds. Default OFF preserves the
+         base sim bit-identically. -->
+    <div class="ctl-row">
+      <div class="ctl-group">
+        <button id="hydro-btn">💧🧪 Hydrolysis: OFF</button>
+        <span class="inline-sliders" id="hydro-sliders">
+          <label>rate
+            <input type="range" id="hydro-rate-slider" min="0" max="1000" value="500" step="1">
+            <span class="val" id="hydro-rate-val">1.0</span>×
+          </label>
+          <label>density
+            <input type="range" id="hydro-density-slider" min="1" max="100" value="10" step="1">
+            <span class="val" id="hydro-density-val">0.0010</span>
+          </label>
+        </span>
+      </div>
+    </div>
+
     <!-- Row 4: GAME MODE — isolated, right-aligned, separate visual band so
          users don't misclick into a sim-disrupting mode change. -->
     <div class="game-row">
@@ -381,6 +431,8 @@
       <kbd>B</kbd> soup brush · <kbd>W</kbd> water brush ·
       <kbd>C</kbd> clear water · <kbd>P</kbd> lysin ·
       <kbd>R</kbd> record · <kbd>G</kbd> play mode ·
+      <kbd>N</kbd> noise · <kbd>H</kbd> hydrolysis ·
+      <kbd>[</kbd> quicksave · <kbd>]</kbd> quickload · <kbd>F</kbd> freeze ·
       <kbd>Esc</kbd> back to pan
     </div>
   </div>

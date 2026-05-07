@@ -542,12 +542,32 @@ export function drawGPU(
     const state = unpackState(atoms[o + 2]);
     const type  = unpackType(atoms[o + 2]);
     const px = _displayX[i], py = _displayY[i];
-    const isFree = state === 0;
+    // Water atoms ('w') always render via the soup path regardless of
+    // state. Spent water (state=1) is the same visual as fresh water
+    // — it's the same molecule, just chemically used. Without this
+    // fix, spent water gets rendered as a large saturated organelle
+    // blob, making it look like decay is "transforming" water into
+    // bigger particles.
+    const isWater = type === 119; // 'w'.charCodeAt(0)
+    const isFree = state === 0 || isWater;
 
     if (isFree) {
       // Soup particle
       const so = pCount * 8;
-      if (bacteriaView) {
+      if (isWater) {
+        // Water gets a fixed flat blue style across all view modes — no
+        // size hash, no microscope grain, no microscope tinting. Same
+        // appearance whether fresh or spent. Distinct enough that the eye
+        // never confuses it with cyan 'c' atoms or any decay-mutated soup.
+        _particleStage[so + 0] = px;
+        _particleStage[so + 1] = py;
+        _particleStage[so + 2] = r * 0.55; // slightly smaller than soup
+        _particleStage[so + 3] = 0.0;       // hard disc, no fade
+        _particleStage[so + 4] = 0.4;
+        _particleStage[so + 5] = 0.8;
+        _particleStage[so + 6] = 1.0;
+        _particleStage[so + 7] = 0.45;      // moderate alpha — visible but not loud
+      } else if (bacteriaView) {
         const h = atomHash32(i, type, state);
         const sizeMul = 0.25 + (h % 600) / 1000;
         const pr = r * sizeMul;
@@ -879,6 +899,7 @@ function colorFor(type: string): [number, number, number] {
     case 'c': return [0.0, 0.867, 0.867];
     case 'd': return [0.2, 0.4, 1.0];
     case 'p': return [1.0, 0.467, 0.0];
+    case 'w': return [0.4, 0.8, 1.0];
     default:  return [1.0, 0.2, 0.2];
   }
 }
