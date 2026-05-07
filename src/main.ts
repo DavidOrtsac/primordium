@@ -1365,22 +1365,23 @@ function loop(): void {
       // of the overlay frozen on top of the live render beneath.
       overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
       overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
-      // Arena boundary on the overlay (sits over the GPU output). Drawn
-      // in every view including microscope so the user always sees the
-      // physical edges of the simulation zone.
-      const z = camera.zoom;
-      overlayCtx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
-      drawArenaBorder(overlayCtx, GRID_W, GRID_H, z);
-      overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+      // Arena boundary on the overlay. Skipped in microscope mode to
+      // preserve the raw-slide aesthetic (no UI elements over the blur).
+      if (viewMode !== 'microscope') {
+        const z = camera.zoom;
+        overlayCtx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+        drawArenaBorder(overlayCtx, GRID_W, GRID_H, z);
+        overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+      }
       if (viewMode === 'educational') drawHUD2D(overlayCtx, snap.iterations, snap.atomCount, snap.atoms);
     } else if (ctx2d) {
       draw2D(ctx2d, snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
-      // Arena boundary on the 2D fallback canvas. draw2D already set the
-      // camera transform; we set it again defensively in case future edits
-      // change that contract.
-      const z = camera.zoom;
-      ctx2d.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
-      drawArenaBorder(ctx2d, GRID_W, GRID_H, z);
+      // Arena boundary on the 2D fallback canvas. Skipped in microscope.
+      if (viewMode !== 'microscope') {
+        const z = camera.zoom;
+        ctx2d.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+        drawArenaBorder(ctx2d, GRID_W, GRID_H, z);
+      }
       if (viewMode === 'educational') {
         // HUD always in screen space — reset transform first
         ctx2d.setTransform(1, 0, 0, 1, 0, 0);
