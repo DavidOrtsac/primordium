@@ -147,8 +147,11 @@
       border-radius: 6px;
       image-rendering: pixelated;
       transition: filter 0.4s ease, border-color 0.3s var(--ease);
-      background: var(--bg-frame);
     }
+    /* Main canvas only — gives a dark frame before the GPU/2D renderer
+       paints. The overlay must stay transparent so HUD layers don't
+       obscure the educational view's GPU output beneath. */
+    canvas#canvas { background: var(--bg-frame); }
     /* Microscope view — phase-contrast slide aesthetic */
     canvas.microscope {
       image-rendering: auto;
@@ -176,6 +179,7 @@
       border: none;
       border-radius: 6px;
       filter: none;
+      background: transparent;  /* must NEVER tint the educational HUD layer */
     }
     .scope-frame canvas#overlay.hidden { display: none; }
     /* Microscope vignette */
