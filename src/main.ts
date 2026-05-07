@@ -125,6 +125,102 @@ canvas.addEventListener('wheel', (e) => {
   camera.zoom = newZoom;
 }, { passive: false });
 
+// ── Touch handlers — mobile support ───────────────────────────────────────
+// Single finger: pan or brush (mirrors mouse drag).
+// Two fingers: pinch-zoom around the midpoint, NEVER triggers brushing.
+// All preventDefault so the page doesn't scroll/zoom while interacting
+// with the canvas.
+let pinchStartDist = 0;
+let pinchStartZoom = 1;
+let pinchStartCamX = 0;
+let pinchStartCamY = 0;
+let pinchStartMidX = 0; // screen-space midpoint at pinch start
+let pinchStartMidY = 0;
+let activeGesture: 'none' | 'single' | 'pinch' = 'none';
+
+function touchDist(t0: Touch, t1: Touch): number {
+  const dx = t0.clientX - t1.clientX;
+  const dy = t0.clientY - t1.clientY;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+canvas.addEventListener('touchstart', (e: TouchEvent) => {
+  if (e.touches.length === 1) {
+    const t = e.touches[0];
+    activeGesture = 'single';
+    dragging = true;
+    lastMx = t.clientX;
+    lastMy = t.clientY;
+    if (brushMode !== 'pan') {
+      applyBrushAt(t.clientX, t.clientY);
+    }
+  } else if (e.touches.length === 2) {
+    activeGesture = 'pinch';
+    dragging = false;
+    pinchStartDist = touchDist(e.touches[0], e.touches[1]);
+    pinchStartZoom = camera.zoom;
+    pinchStartCamX = camera.x;
+    pinchStartCamY = camera.y;
+    const rect = canvas.getBoundingClientRect();
+    pinchStartMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+    pinchStartMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+  }
+  e.preventDefault();
+}, { passive: false });
+
+canvas.addEventListener('touchmove', (e: TouchEvent) => {
+  if (activeGesture === 'pinch' && e.touches.length === 2) {
+    // Pinch-zoom around the original midpoint so the two fingers stay
+    // anchored to the world points they grabbed at gesture start.
+    const newDist = touchDist(e.touches[0], e.touches[1]);
+    if (pinchStartDist > 0 && newDist > 0) {
+      const scale = newDist / pinchStartDist;
+      const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, pinchStartZoom * scale));
+      // Anchor the pinch midpoint world position so it stays under the fingers
+      const worldX = pinchStartMidX / pinchStartZoom + pinchStartCamX;
+      const worldY = pinchStartMidY / pinchStartZoom + pinchStartCamY;
+      camera.x = worldX - pinchStartMidX / newZoom;
+      camera.y = worldY - pinchStartMidY / newZoom;
+      camera.zoom = newZoom;
+    }
+  } else if (activeGesture === 'single' && e.touches.length === 1 && dragging) {
+    const t = e.touches[0];
+    if (brushMode === 'pan') {
+      const dx = t.clientX - lastMx, dy = t.clientY - lastMy;
+      camera.x -= dx / camera.zoom;
+      camera.y -= dy / camera.zoom;
+      lastMx = t.clientX; lastMy = t.clientY;
+    } else {
+      const dx = t.clientX - lastMx, dy = t.clientY - lastMy;
+      if (dx * dx + dy * dy >= 6 * 6) {
+        applyBrushAt(t.clientX, t.clientY);
+        lastMx = t.clientX; lastMy = t.clientY;
+      }
+    }
+  }
+  e.preventDefault();
+}, { passive: false });
+
+canvas.addEventListener('touchend', (e: TouchEvent) => {
+  if (e.touches.length === 0) {
+    activeGesture = 'none';
+    dragging = false;
+  } else if (e.touches.length === 1 && activeGesture === 'pinch') {
+    // Lifted one finger of a pinch — transition into single-finger pan
+    // without firing a brush stroke.
+    activeGesture = 'single';
+    dragging = true;
+    lastMx = e.touches[0].clientX;
+    lastMy = e.touches[0].clientY;
+  }
+  e.preventDefault();
+}, { passive: false });
+
+canvas.addEventListener('touchcancel', () => {
+  activeGesture = 'none';
+  dragging = false;
+}, { passive: true });
+
 // ── Worker ──────────────────────────────────────────────────────────────────
 const worker = new Worker('dist/worker.js');
 function send(msg: ControlMsg): void { worker.postMessage(msg); }
@@ -991,6 +1087,31 @@ csvBtn.addEventListener('click', downloadCSV);
 csvClearBtn.addEventListener('click', clearStats);
 noiseBtn.addEventListener('click', toggleNoise);
 hydroBtn.addEventListener('click', toggleHydro);
+
+// ── Mobile collapse toggle for the control bar ─────────────────────────────
+// Visible only via the @media query in index.html (.ctl-toggle is display:
+// none on desktop). On touch / narrow screens, tapping it expands the full
+// control bar; tapping again collapses it back to just the always-visible
+// brush/view/select row. Default state is "collapsed" so first paint on
+// mobile shows the canvas large.
+const ctlToggle = document.getElementById('ctl-toggle') as HTMLButtonElement | null;
+const controlBar = document.getElementById('control-bar') as HTMLDivElement;
+function isMobileLayout(): boolean {
+  // Same condition as the @media query — narrow OR coarse pointer.
+  return window.matchMedia('(max-width: 900px), (pointer: coarse)').matches;
+}
+if (ctlToggle && controlBar) {
+  // Start collapsed on mobile so the canvas is the focal element.
+  if (isMobileLayout()) controlBar.classList.add('collapsed');
+  ctlToggle.addEventListener('click', () => {
+    const collapsed = controlBar.classList.toggle('collapsed');
+    ctlToggle.textContent = collapsed ? '☰ Controls' : '✕ Hide';
+  });
+  // If the user resizes (e.g. rotation), keep the toggle state sensible.
+  window.addEventListener('resize', () => {
+    if (!isMobileLayout()) controlBar.classList.remove('collapsed');
+  });
+}
 eventsDlBtn.addEventListener('click', downloadEventsCSV);
 eventsClearBtn.addEventListener('click', clearEvents);
 recBtn.addEventListener('click', toggleRecording);
