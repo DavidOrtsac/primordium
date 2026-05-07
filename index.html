@@ -182,36 +182,49 @@
       background: transparent;  /* must NEVER tint the educational HUD layer */
     }
     .scope-frame canvas#overlay.hidden { display: none; }
-    /* Fullscreen toggle — small floating button at top-right of canvas frame.
-       Visible always but understated; becomes the exit button in FS mode. */
-    .fs-toggle {
+    /* Floating tool buttons at top-right of the canvas frame: ☰ controls
+       and ⛶ fullscreen. Group them in a small flex container so they
+       align cleanly and can be repositioned together. */
+    .canvas-tools {
       position: absolute;
       top: 8px;
       right: 8px;
-      width: 32px;
-      height: 32px;
+      display: flex;
+      gap: 6px;
+      z-index: 12;
+    }
+    .canvas-tool-btn {
+      width: 36px;
+      height: 36px;
       min-height: 0;
       padding: 0;
       background: rgba(8, 8, 10, 0.55);
       border: 1px solid var(--border-subtle);
       color: var(--text-default);
-      font-size: 0.95rem;
+      font-size: 1rem;
       line-height: 1;
       border-radius: 6px;
       backdrop-filter: blur(6px);
       -webkit-backdrop-filter: blur(6px);
-      z-index: 12;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       transition: background 0.16s var(--ease), border-color 0.16s var(--ease), color 0.16s var(--ease);
     }
-    .fs-toggle:hover {
-      background: rgba(20, 20, 22, 0.75);
+    .canvas-tool-btn:hover {
+      background: rgba(20, 20, 22, 0.78);
       border-color: var(--border-emph);
       color: var(--text-bright);
     }
+    /* Active state for the menu toggle when panel is open: subtle gold tint */
+    .canvas-tool-btn.active {
+      background: rgba(212, 166, 79, 0.16);
+      border-color: rgba(212, 166, 79, 0.55);
+      color: var(--c-primary);
+    }
+    /* Backwards-compat — anywhere old .fs-toggle CSS is referenced */
+    .fs-toggle { /* deprecated, retained for safety */ }
 
     /* Microscope vignette */
     .scope-frame::after {
@@ -586,6 +599,180 @@
       text-align: right;
     }
 
+    /* ──────────────────────────────────────────────────────────────────
+       CONTROL PANEL — slides in from the right, overlays the canvas.
+       Glassmorphic surface with backdrop-blur so the simulation remains
+       dimly visible behind it. Designed to stay open through interactions
+       (clicking buttons, dragging sliders) so the user can adjust controls
+       without constantly reopening. Only closes on explicit dismiss
+       (X button, M key, Esc, or backdrop click on mobile). */
+
+    .control-panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 380px;
+      max-width: 92vw;
+      background: rgba(10, 10, 12, 0.82);
+      backdrop-filter: blur(22px) saturate(1.15);
+      -webkit-backdrop-filter: blur(22px) saturate(1.15);
+      border-left: 1px solid rgba(212, 166, 79, 0.22);
+      box-shadow:
+        -24px 0 60px -24px rgba(0, 0, 0, 0.7),
+        inset 1px 0 0 0 rgba(212, 166, 79, 0.04);
+      transform: translateX(100%);
+      transition: transform 0.24s var(--ease);
+      z-index: 50;
+      overflow-y: auto;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+      -webkit-overflow-scrolling: touch;
+    }
+    .control-panel.open {
+      transform: translateX(0);
+    }
+    .control-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border-subtle);
+      position: sticky;
+      top: 0;
+      background: rgba(10, 10, 12, 0.92);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      z-index: 1;
+      flex-shrink: 0;
+    }
+    .control-panel-title {
+      font-family: var(--font-sans);
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.32em;
+      text-transform: uppercase;
+      color: var(--c-primary);
+      padding-left: 0.32em;
+    }
+    .panel-close {
+      width: 32px;
+      height: 32px;
+      min-height: 0;
+      padding: 0;
+      border-radius: var(--r-md);
+      background: var(--surface-2);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-default);
+      font-size: 0.95rem;
+      line-height: 1;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.16s var(--ease), border-color 0.16s var(--ease), color 0.16s var(--ease);
+    }
+    .panel-close:hover {
+      background: var(--surface-3);
+      border-color: var(--border-emph);
+      color: var(--text-bright);
+    }
+    .control-panel-body {
+      flex: 1;
+      padding: 12px 14px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    /* Inside the panel, the control bar layout becomes a single column.
+       Cards still use their themed accents — they're just now stacked
+       vertically inside the panel rather than tiled in a grid. */
+    .control-panel .control-bar {
+      display: flex;
+      flex-direction: column;
+      gap: var(--gap-default);
+      width: 100%;
+      max-width: none;
+    }
+
+    /* Backdrop — only used on mobile when panel is open. Dims the canvas
+       behind the panel and gives the user a clear close-region (tap to
+       dismiss). On desktop the panel is narrow enough that no backdrop
+       is needed; canvas remains visible to its left. */
+    .control-panel-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.42);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.24s var(--ease);
+      z-index: 49;
+      display: none; /* hidden on desktop */
+    }
+    .control-panel-backdrop.shown {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    /* Shortcut badges — small key caps shown in the corner of any button
+       that has a keyboard shortcut. Inline-flex so they sit cleanly
+       next to the button label without disrupting layout. */
+    .kbd-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-left: 6px;
+      padding: 1px 5px;
+      min-width: 14px;
+      font-family: var(--font-mono);
+      font-size: 0.62rem;
+      line-height: 1.4;
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid var(--border-subtle);
+      border-radius: 3px;
+      color: var(--text-muted);
+      letter-spacing: 0;
+      transition: background 0.16s var(--ease), color 0.16s var(--ease), border-color 0.16s var(--ease);
+    }
+    button:hover .kbd-badge,
+    button.active .kbd-badge {
+      background: rgba(255, 255, 255, 0.13);
+      color: var(--text-bright);
+      border-color: var(--border-emph);
+    }
+
+    /* Shortcuts card — paired list of key + description */
+    .card.card--shortcuts::before {
+      background: linear-gradient(90deg, transparent, var(--text-muted), transparent);
+    }
+    .card.card--shortcuts .card__label { color: var(--text-muted); }
+    .shortcuts-list {
+      display: grid;
+      grid-template-columns: minmax(48px, auto) 1fr;
+      gap: 5px 12px;
+      align-items: center;
+      font-family: var(--font-sans);
+      font-size: 0.72rem;
+    }
+    .shortcuts-list kbd {
+      background: var(--surface-2);
+      border: 1px solid var(--border-subtle);
+      border-radius: 3px;
+      padding: 2px 7px;
+      color: var(--text-default);
+      font-family: var(--font-mono);
+      font-size: 0.70rem;
+      box-shadow: 0 1px 0 var(--border-emph);
+      text-align: center;
+      white-space: nowrap;
+      justify-self: start;
+    }
+    .shortcuts-list .desc {
+      color: var(--text-muted);
+      letter-spacing: 0.005em;
+    }
+
     /* ── Mobile: hamburger toggle visible only on narrow / coarse-pointer */
     .ctl-toggle { display: none; }
 
@@ -650,34 +837,22 @@
       input[type=range] { min-height: 32px; }
       #burn-iters, #seed-input { min-height: 36px; font-size: 0.86rem; }
 
-      .ctl-toggle {
-        display: inline-flex;
-        background: var(--surface-2);
-        border: 1px solid var(--border-emph);
-        border-radius: var(--r-md);
-        padding: 9px 16px;
-        color: var(--text-bright);
-        font-family: var(--font-sans);
-        font-size: 0.84rem;
-        font-weight: 500;
-        cursor: pointer;
-        margin: 4px 0;
-        min-height: 42px;
-        align-items: center;
-        gap: 8px;
+      /* Panel-style controls now own all the chrome; the legacy mobile
+         hamburger underneath the canvas is no longer needed. Hide it. */
+      .ctl-toggle { display: none !important; }
+
+      /* Mobile panel: full-width, backdrop active */
+      .control-panel {
+        width: 92vw;
+        max-width: none;
       }
-      .ctl-toggle:hover { background: var(--surface-3); }
+      .control-panel-backdrop {
+        display: block;
+      }
 
       .control-bar {
         grid-template-columns: 1fr;
         gap: var(--gap-snug);
-      }
-      .control-bar.collapsed > .card,
-      .control-bar.collapsed > .hint-row {
-        display: none;
-      }
-      .control-bar.collapsed > .card.always-visible {
-        display: flex;
       }
       .hint-row { display: none; }
       .inline-sliders { font-size: 0.72rem; }
@@ -722,7 +897,7 @@
       background: #000;
       height: 100vh;
     }
-    body.canvas-fullscreen > *:not(#scope-frame):not(.fs-toggle) {
+    body.canvas-fullscreen > *:not(#scope-frame):not(.fs-toggle):not(#control-panel):not(#panel-backdrop) {
       display: none !important;
     }
     body.canvas-fullscreen #scope-frame {
@@ -774,7 +949,10 @@
   <div id="scope-frame" class="scope-frame">
     <canvas id="canvas"></canvas>
     <canvas id="overlay"></canvas>
-    <button id="fs-toggle" class="fs-toggle" aria-label="Toggle fullscreen" title="Fullscreen">⛶</button>
+    <div class="canvas-tools">
+      <button id="menu-toggle" class="canvas-tool-btn" aria-label="Toggle controls panel" title="Controls (M)">☰</button>
+      <button id="fs-toggle" class="canvas-tool-btn" aria-label="Toggle fullscreen" title="Fullscreen">⛶</button>
+    </div>
     <div id="game-overlay">
       <div id="game-overlay-title"></div>
       <div id="game-overlay-sub"></div>
@@ -783,17 +961,31 @@
 
   <div id="status">booting…</div>
 
+  <!-- Mobile-fallback toggle (kept for accessibility / no-JS cases). The
+       primary opener is now the floating ☰ in the canvas corner. -->
   <button class="ctl-toggle" id="ctl-toggle" aria-label="Toggle controls">☰ Controls</button>
 
-  <div class="control-bar" id="control-bar">
+  <!-- Panel backdrop — only visible on mobile when panel is open -->
+  <div id="panel-backdrop" class="control-panel-backdrop" aria-hidden="true"></div>
+
+  <!-- THE control panel. Slides in from the right; overlays the canvas
+       (canvas stays put, panel sits on top of right ~30%). All controls
+       live inside; the page outside is canvas + chrome only. -->
+  <aside id="control-panel" class="control-panel" aria-hidden="true">
+    <div class="control-panel-header">
+      <span class="control-panel-title">Controls</span>
+      <button id="panel-close" class="panel-close" aria-label="Close controls panel" title="Close (M / Esc)">✕</button>
+    </div>
+    <div class="control-panel-body">
+      <div class="control-bar" id="control-bar">
 
     <!-- VIEW & PLAYBACK — always visible on mobile -->
     <div class="card card--view always-visible">
       <div class="card__label">View · Playback</div>
       <div class="card__row">
-        <button id="pause-btn">Pause</button>
-        <button id="view-btn">View: Educational</button>
-        <button id="rec-btn">● REC</button>
+        <button id="pause-btn">Pause<span class="kbd-badge">␣</span></button>
+        <button id="view-btn">View: Educational<span class="kbd-badge">V</span></button>
+        <button id="rec-btn">● REC<span class="kbd-badge">R</span></button>
       </div>
     </div>
 
@@ -801,13 +993,13 @@
     <div class="card card--brushes always-visible">
       <div class="card__label">Brushes · Tools</div>
       <div class="card__row">
-        <button id="soup-brush-btn">🖌 Soup</button>
-        <button id="water-brush-btn">💧 Water</button>
-        <button id="clear-water-btn">Clear water</button>
+        <button id="soup-brush-btn">🖌 Soup<span class="kbd-badge">B</span></button>
+        <button id="water-brush-btn">💧 Water<span class="kbd-badge">W</span></button>
+        <button id="clear-water-btn">Clear water<span class="kbd-badge">C</span></button>
       </div>
       <div class="card__row">
         <button id="select-btn">🎯 Select atom</button>
-        <button id="lysin-btn">Lysin: OFF</button>
+        <button id="lysin-btn">Lysin: OFF<span class="kbd-badge">P</span></button>
       </div>
     </div>
 
@@ -863,7 +1055,7 @@
     <div class="card card--mutation">
       <div class="card__label">Mutation Lab</div>
       <div class="card__row">
-        <button id="noise-btn">🧬 Noise: OFF</button>
+        <button id="noise-btn">🧬 Noise: OFF<span class="kbd-badge">N</span></button>
       </div>
       <span class="inline-sliders" id="noise-sliders">
         <label>copy
@@ -885,7 +1077,7 @@
     <div class="card card--hydro">
       <div class="card__label">Decomposition</div>
       <div class="card__row">
-        <button id="hydro-btn">💧🧪 Hydrolysis: OFF</button>
+        <button id="hydro-btn">💧🧪 Hydrolysis: OFF<span class="kbd-badge">H</span></button>
       </div>
       <span class="inline-sliders" id="hydro-sliders">
         <label>rate
@@ -924,22 +1116,43 @@
     <div class="card card--game">
       <div class="card__label">Play Mode</div>
       <div class="card__row">
-        <button id="game-btn">🦠 Steer a microbe</button>
+        <button id="game-btn">🦠 Steer a microbe<span class="kbd-badge">G</span></button>
       </div>
     </div>
 
-    <!-- Hint row — desktop only -->
-    <div class="hint-row">
-      <kbd>drag</kbd> pan · <kbd>wheel</kbd> zoom ·
-      <kbd>Space</kbd> pause · <kbd>V</kbd> view ·
-      <kbd>B</kbd> soup · <kbd>W</kbd> water ·
-      <kbd>C</kbd> clear water · <kbd>P</kbd> lysin ·
-      <kbd>R</kbd> record · <kbd>G</kbd> play mode ·
-      <kbd>N</kbd> noise · <kbd>H</kbd> hydrolysis ·
-      <kbd>[</kbd> quicksave · <kbd>]</kbd> quickload · <kbd>F</kbd> freeze ·
-      <kbd>Esc</kbd> back to pan
+    <!-- Shortcuts — full keybind list inside the panel for at-a-glance ref -->
+    <div class="card card--shortcuts">
+      <div class="card__label">Shortcuts</div>
+      <div class="shortcuts-list">
+        <kbd>M</kbd>           <span class="desc">open / close this panel</span>
+        <kbd>Space</kbd>       <span class="desc">pause / resume</span>
+        <kbd>V</kbd>           <span class="desc">cycle view (Educational → Microscope → Classic)</span>
+        <kbd>B</kbd>           <span class="desc">soup brush</span>
+        <kbd>W</kbd>           <span class="desc">water brush</span>
+        <kbd>C</kbd>           <span class="desc">clear all water</span>
+        <kbd>P</kbd>           <span class="desc">lysin on / off</span>
+        <kbd>R</kbd>           <span class="desc">record video</span>
+        <kbd>G</kbd>           <span class="desc">play mode (steer a microbe)</span>
+        <kbd>N</kbd>           <span class="desc">noise on / off</span>
+        <kbd>H</kbd>           <span class="desc">hydrolysis on / off</span>
+        <kbd>[</kbd>           <span class="desc">quicksave</span>
+        <kbd>]</kbd>           <span class="desc">quickload</span>
+        <kbd>F</kbd>           <span class="desc">freeze (pause + zero noise + quicksave)</span>
+        <kbd>Del</kbd>         <span class="desc">delete selected atom (in Select mode)</span>
+        <kbd>Esc</kbd>         <span class="desc">close panel / back to pan</span>
+        <kbd>drag</kbd>        <span class="desc">pan camera</span>
+        <kbd>wheel</kbd>       <span class="desc">zoom under cursor</span>
+        <kbd>2-finger</kbd>    <span class="desc">pinch to zoom (touch)</span>
+      </div>
     </div>
-  </div>
+
+    <!-- Old hint row — kept for reference / accessibility but visually
+         hidden via the .hint-row CSS class. The Shortcuts card above
+         replaces it inside the panel. -->
+    <div class="hint-row" hidden></div>
+      </div>
+    </div>
+  </aside>
 
   <script>
     // Cache-bust bundle.js with a per-page-load timestamp so iOS Safari
