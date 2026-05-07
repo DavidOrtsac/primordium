@@ -5,30 +5,151 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="theme-color" content="#111111" />
+  <meta name="theme-color" content="#0a0a0a" />
   <title>Primordium</title>
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    /* ──────────────────────────────────────────────────────────────────────
+       PRIMORDIUM — design system
+       Tokens, typography, components. All UI styling lives here.
+       Canvas-rendering effects (microscope filter, vignette) are below. */
+
+    :root {
+      /* Surface palette — dark, slightly warm, with depth */
+      --bg-deep:        #08080a;
+      --bg-frame:       #0e0e10;
+      --surface-1:      rgba(255, 255, 255, 0.025);
+      --surface-2:      rgba(255, 255, 255, 0.055);
+      --surface-3:      rgba(255, 255, 255, 0.095);
+      --border-subtle:  rgba(255, 255, 255, 0.06);
+      --border-emph:    rgba(255, 255, 255, 0.14);
+      --border-strong:  rgba(255, 255, 255, 0.22);
+
+      /* Text */
+      --text-bright:    #f5f5f5;
+      --text-default:   #c8c8c8;
+      --text-muted:     #7a7a7a;
+      --text-faint:     #4a4a4a;
+      --text-ghost:     #2e2e2e;
+
+      /* Accent palette — keyed to atom & domain colors so the UI teaches
+         itself: water tools feel watery, mutation tools feel mutagenic, etc. */
+      --c-primary:      #d4a64f;   /* warm gold, membrane atom, brand */
+      --c-water:        #66ccff;
+      --c-life:         #5edca0;   /* game mode green */
+      --c-mutation:     #c97df7;   /* DNA purple */
+      --c-hydrolysis:   #4dd9e8;   /* aqua */
+      --c-record:       #ff5757;
+      --c-soup:         #d4a880;
+      --c-lysin:        #ff8844;
+      --c-archive:      #9ca8d4;   /* cool blue-gray, neutral but distinct */
+
+      /* Typography */
+      --font-sans:      -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+      --font-mono:      ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+      /* Geometry */
+      --r-sm: 4px;
+      --r-md: 7px;
+      --r-lg: 11px;
+      --r-card: 14px;
+      --gap-tight:   4px;
+      --gap-snug:    8px;
+      --gap-default: 12px;
+      --gap-loose:   18px;
+      --gap-section: 24px;
+
+      /* Motion */
+      --ease: cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      background: var(--bg-deep);
+      color: var(--text-default);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
     body {
-      background: #111;
+      min-height: 100vh;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      font-family: monospace;
-      color: #ccc;
-      gap: 12px;
+      justify-content: flex-start;
+      gap: var(--gap-default);
+      padding: 18px 16px 32px;
+      /* Subtle radial spotlight behind the canvas — very faint, gives the
+         page a sense of depth without distracting from the sim. */
+      background:
+        radial-gradient(ellipse 1200px 600px at 50% 30%, rgba(212, 166, 79, 0.025), transparent 70%),
+        radial-gradient(ellipse 800px 400px at 50% 60%, rgba(102, 204, 255, 0.018), transparent 70%),
+        var(--bg-deep);
     }
-    .title-block { text-align: center; line-height: 1.4; }
-    .title-block h1 { font-size: 1.2rem; letter-spacing: 0.08em; color: #ddd; }
-    .title-block small { font-size: 0.7rem; color: #555; letter-spacing: 0.04em; }
+
+    /* ── Hero title ─────────────────────────────────────────────────────── */
+    .title-block {
+      text-align: center;
+      padding: 4px 0 2px;
+      user-select: none;
+    }
+    .title-block h1 {
+      font-family: var(--font-sans);
+      font-weight: 200;
+      font-size: 1.6rem;
+      letter-spacing: 0.42em;
+      padding-left: 0.42em; /* visual centering with letter-spacing */
+      background: linear-gradient(110deg, var(--c-primary) 0%, var(--c-water) 60%, var(--c-mutation) 100%);
+      background-size: 220% auto;
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      animation: shimmer 18s linear infinite;
+      line-height: 1;
+    }
+    @keyframes shimmer {
+      from { background-position: 0% 50%; }
+      to   { background-position: 220% 50%; }
+    }
+    .title-block small {
+      display: block;
+      font-family: var(--font-sans);
+      font-size: 0.66rem;
+      font-weight: 400;
+      letter-spacing: 0.16em;
+      color: var(--text-faint);
+      margin-top: 6px;
+      text-transform: uppercase;
+    }
+    .title-block small a {
+      color: var(--text-muted);
+      text-decoration: none;
+      border-bottom: 1px dotted var(--text-ghost);
+      transition: color 0.18s var(--ease), border-color 0.18s var(--ease);
+    }
+    .title-block small a:hover {
+      color: var(--c-primary);
+      border-bottom-color: var(--c-primary);
+    }
+
+    /* ── Canvas frame ──────────────────────────────────────────────────────
+       The simulation is the focal point. Frame it like a microscope slide:
+       subtle border, soft inner shadow, a barely-visible ambient glow. */
     canvas {
-      border: 1px solid #333;
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
       image-rendering: pixelated;
-      transition: filter 0.4s ease;
+      transition: filter 0.4s ease, border-color 0.3s var(--ease);
+      background: var(--bg-frame);
     }
-    /* Microscope view — phase-contrast slide aesthetic. CSS filter is GPU-cheap. */
+    /* Microscope view — phase-contrast slide aesthetic */
     canvas.microscope {
       image-rendering: auto;
       filter:
@@ -36,28 +157,46 @@
         contrast(1.22)
         saturate(0.35)
         brightness(0.98);
-      border-color: #333;
     }
-    /* Vignette overlay for the microscope — sits on top of the canvas as a
-       darkening ring, like the edge fall-off of a real condenser lens. */
+    /* Frame wrapper: positioning + ambient glow ring */
     .scope-frame {
       position: relative;
       display: inline-block;
       line-height: 0;
+      box-shadow:
+        0 0 0 1px var(--border-subtle),
+        0 20px 60px -20px rgba(212, 166, 79, 0.10),
+        0 0 80px -30px rgba(102, 204, 255, 0.08);
+      border-radius: 8px;
     }
     .scope-frame canvas#overlay {
       position: absolute;
       inset: 0;
       pointer-events: none;
       border: none;
+      border-radius: 6px;
       filter: none;
     }
     .scope-frame canvas#overlay.hidden { display: none; }
-    #status {
-      font-size: 0.7rem;
-      color: #666;
-      letter-spacing: 0.06em;
+    /* Microscope vignette */
+    .scope-frame::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      border-radius: 6px;
+      background: radial-gradient(
+        ellipse at center,
+        rgba(0, 0, 0, 0)   55%,
+        rgba(0, 0, 0, 0.35) 90%,
+        rgba(0, 0, 0, 0.55) 100%
+      );
+      opacity: 0;
+      transition: opacity 0.4s var(--ease);
     }
+    .scope-frame.microscope::after { opacity: 1; }
+
+    /* ── Game overlay ──────────────────────────────────────────────────── */
     #game-overlay {
       position: absolute;
       inset: 0;
@@ -66,230 +205,389 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 28px;
-      background: rgba(0,0,0,0.55);
+      gap: 24px;
+      background: rgba(8, 8, 10, 0.72);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
       z-index: 10;
-      font-family: monospace;
       text-align: center;
+      border-radius: 6px;
     }
     #game-overlay-title {
-      font-size: 2.4rem;
-      letter-spacing: 0.18em;
+      font-family: var(--font-sans);
+      font-weight: 200;
+      font-size: 2.6rem;
+      letter-spacing: 0.16em;
       text-transform: uppercase;
       line-height: 1.2;
-      padding: 0 0.18em;          /* compensate for letter-spacing on the last letter */
+      padding: 0 0.18em;
     }
     #game-overlay-sub {
       font-size: 0.95rem;
-      color: #bbb;
+      color: var(--text-default);
       letter-spacing: 0.06em;
-      line-height: 1.4;
     }
-    .scope-frame::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      border-radius: 0;
-      background: radial-gradient(
-        ellipse at center,
-        rgba(0,0,0,0)   55%,
-        rgba(0,0,0,0.35) 90%,
-        rgba(0,0,0,0.55) 100%
-      );
-      opacity: 0;
-      transition: opacity 0.4s ease;
+
+    /* ── Status line ──────────────────────────────────────────────────────
+       A telegraphic line that pulses on every action. Mono font for the
+       teletype feel; subtle leading dot indicates the sim is alive. */
+    #status {
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      color: var(--text-muted);
+      letter-spacing: 0.02em;
+      min-height: 1.4em;
+      padding: 6px 14px;
+      border-radius: var(--r-md);
+      background: var(--surface-1);
+      border: 1px solid var(--border-subtle);
+      transition: color 0.2s var(--ease), background 0.2s var(--ease), border-color 0.2s var(--ease);
+      max-width: 90%;
+      text-align: center;
     }
-    .scope-frame.microscope::after { opacity: 1; }
-    /* ── Control bar ──────────────────────────────────────────────────────
-       Multi-row layout so buttons don't sprawl horizontally. Each row is a
-       semantic group; rows are separated by margin so groups feel distinct. */
+    #status::before {
+      content: '◉ ';
+      color: var(--c-life);
+      animation: heartbeat 2.4s ease-in-out infinite;
+    }
+    @keyframes heartbeat {
+      0%, 100% { opacity: 0.5; }
+      50%      { opacity: 1.0; }
+    }
+    #status.flash {
+      color: var(--text-bright);
+      background: var(--surface-2);
+      border-color: var(--border-emph);
+    }
+
+    /* ── Control bar — card grid ──────────────────────────────────────────
+       Each functional area becomes a labeled card in a responsive grid.
+       Auto-fit means cards naturally pack into 1, 2, or 3 columns
+       depending on viewport width. */
     .control-bar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: var(--gap-default);
+      width: min(100%, 1400px);
+      align-items: stretch;
+    }
+
+    .card {
+      background: var(--surface-1);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--r-card);
+      padding: 12px 14px 14px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
-      align-items: center;
-      width: min(100%, 1400px);
-    }
-    .ctl-row {
-      display: flex;
       gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-      justify-content: center;
-      font-size: 0.8rem;
+      transition: border-color 0.2s var(--ease), background 0.2s var(--ease);
+      position: relative;
+      overflow: hidden;
     }
-    .ctl-group {
-      display: inline-flex;
+    .card:hover {
+      background: var(--surface-2);
+      border-color: var(--border-emph);
+    }
+    /* Themed cards have a colored 1px top accent edge */
+    .card.card--brushes::before,
+    .card.card--mutation::before,
+    .card.card--hydro::before,
+    .card.card--game::before,
+    .card.card--archive::before,
+    .card.card--world::before,
+    .card.card--view::before,
+    .card.card--physics::before {
+      content: '';
+      position: absolute;
+      inset: 0 0 auto 0;
+      height: 1px;
+      opacity: 0.8;
+    }
+    .card.card--view::before     { background: linear-gradient(90deg, transparent, var(--c-primary),    transparent); }
+    .card.card--brushes::before  { background: linear-gradient(90deg, transparent, var(--c-soup),       transparent); }
+    .card.card--world::before    { background: linear-gradient(90deg, transparent, var(--c-water),      transparent); }
+    .card.card--physics::before  { background: linear-gradient(90deg, transparent, var(--c-primary),    transparent); }
+    .card.card--mutation::before { background: linear-gradient(90deg, transparent, var(--c-mutation),   transparent); }
+    .card.card--hydro::before    { background: linear-gradient(90deg, transparent, var(--c-hydrolysis), transparent); }
+    .card.card--archive::before  { background: linear-gradient(90deg, transparent, var(--c-archive),    transparent); }
+    .card.card--game::before     { background: linear-gradient(90deg, transparent, var(--c-life),       transparent); }
+
+    .card__label {
+      font-family: var(--font-sans);
+      font-size: 0.62rem;
+      font-weight: 600;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      user-select: none;
+    }
+    .card.card--brushes  .card__label { color: var(--c-soup); }
+    .card.card--world    .card__label { color: var(--c-water); }
+    .card.card--mutation .card__label { color: var(--c-mutation); }
+    .card.card--hydro    .card__label { color: var(--c-hydrolysis); }
+    .card.card--archive  .card__label { color: var(--c-archive); }
+    .card.card--game     .card__label { color: var(--c-life); }
+    .card.card--view     .card__label { color: var(--c-primary); }
+    .card.card--physics  .card__label { color: var(--c-primary); }
+
+    .card__row {
+      display: flex;
+      flex-wrap: wrap;
       gap: 6px;
       align-items: center;
+    }
+    .card__row + .card__row { margin-top: 2px; }
+
+    /* ── Buttons ──────────────────────────────────────────────────────── */
+    button {
+      background: var(--surface-2);
+      color: var(--text-default);
+      border: 1px solid var(--border-subtle);
+      padding: 7px 12px;
+      cursor: pointer;
+      font-family: var(--font-sans);
+      font-size: 0.83rem;
+      font-weight: 500;
+      border-radius: var(--r-md);
+      min-height: 32px;
+      white-space: nowrap;
+      transition: all 0.16s var(--ease);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      letter-spacing: 0.005em;
+    }
+    button:hover {
+      background: var(--surface-3);
+      color: var(--text-bright);
+      border-color: var(--border-emph);
+    }
+    button:active { transform: translateY(1px); }
+    button:disabled { opacity: 0.32; cursor: not-allowed; }
+    button:disabled:hover { background: var(--surface-2); border-color: var(--border-subtle); }
+
+    /* Themed active-state buttons. Each gets its domain accent color. */
+    button.active {
+      background: rgba(212, 166, 79, 0.12);
+      border-color: rgba(212, 166, 79, 0.55);
+      color: var(--c-primary);
+      box-shadow: 0 0 0 1px rgba(212, 166, 79, 0.25), 0 0 18px -6px rgba(212, 166, 79, 0.45);
+    }
+    /* Per-button accent overrides, by id, when active */
+    #soup-brush-btn.active   { background: rgba(212, 168, 128, 0.13); border-color: rgba(212, 168, 128, 0.55); color: var(--c-soup);       box-shadow: 0 0 0 1px rgba(212, 168, 128, 0.25), 0 0 16px -6px rgba(212, 168, 128, 0.40); }
+    #water-brush-btn.active  { background: rgba(102, 204, 255, 0.13); border-color: rgba(102, 204, 255, 0.55); color: var(--c-water);      box-shadow: 0 0 0 1px rgba(102, 204, 255, 0.25), 0 0 16px -6px rgba(102, 204, 255, 0.45); }
+    #select-btn.active       { background: rgba(245, 220, 80,  0.13); border-color: rgba(245, 220, 80,  0.55); color: #ffe066;             box-shadow: 0 0 0 1px rgba(245, 220, 80,  0.25), 0 0 16px -6px rgba(245, 220, 80,  0.40); }
+    #lysin-btn.active        { background: rgba(255, 136, 68,  0.13); border-color: rgba(255, 136, 68,  0.55); color: var(--c-lysin);      box-shadow: 0 0 0 1px rgba(255, 136, 68,  0.25), 0 0 16px -6px rgba(255, 136, 68,  0.45); }
+    #drip-btn.active         { background: rgba(102, 204, 255, 0.13); border-color: rgba(102, 204, 255, 0.55); color: var(--c-water);      box-shadow: 0 0 0 1px rgba(102, 204, 255, 0.25), 0 0 16px -6px rgba(102, 204, 255, 0.45); }
+    #noise-btn.active        { background: rgba(201, 125, 247, 0.13); border-color: rgba(201, 125, 247, 0.55); color: var(--c-mutation);   box-shadow: 0 0 0 1px rgba(201, 125, 247, 0.25), 0 0 16px -6px rgba(201, 125, 247, 0.45); }
+    #hydro-btn.active        { background: rgba(77,  217, 232, 0.13); border-color: rgba(77,  217, 232, 0.55); color: var(--c-hydrolysis); box-shadow: 0 0 0 1px rgba(77,  217, 232, 0.25), 0 0 16px -6px rgba(77,  217, 232, 0.45); }
+    #view-btn.active         { background: rgba(212, 166, 79,  0.13); border-color: rgba(212, 166, 79,  0.55); color: var(--c-primary); }
+
+    /* Recording (REC) button — urgent red, blinking */
+    #rec-btn { min-width: 72px; }
+    button.recording {
+      background: rgba(255, 87, 87, 0.14);
+      border-color: rgba(255, 87, 87, 0.65);
+      color: var(--c-record);
+      animation: blink 1.2s ease-in-out infinite;
+    }
+    button.recording:hover { background: rgba(255, 87, 87, 0.22); }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.55; }
+    }
+
+    /* Game / play-mode button — distinct alive-green */
+    #game-btn {
+      background: rgba(94, 220, 160, 0.06);
+      border-color: rgba(94, 220, 160, 0.30);
+      color: var(--c-life);
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+    #game-btn:hover {
+      background: rgba(94, 220, 160, 0.12);
+      border-color: rgba(94, 220, 160, 0.50);
+    }
+    #game-btn.active {
+      background: rgba(94, 220, 160, 0.16);
+      border-color: rgba(94, 220, 160, 0.65);
+      color: var(--c-life);
+      box-shadow: 0 0 0 1px rgba(94, 220, 160, 0.30), 0 0 22px -6px rgba(94, 220, 160, 0.55);
+    }
+
+    /* ── Inputs ───────────────────────────────────────────────────────── */
+    #burn-iters, #seed-input {
+      background: var(--surface-1);
+      color: var(--text-bright);
+      border: 1px solid var(--border-subtle);
+      padding: 6px 10px;
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      border-radius: var(--r-md);
+      width: 96px;
+      min-height: 32px;
+      transition: border-color 0.16s var(--ease), background 0.16s var(--ease);
+    }
+    #burn-iters:focus, #seed-input:focus {
+      outline: none;
+      border-color: var(--border-strong);
+      background: var(--surface-2);
+    }
+    #seed-input { width: 80px; }
+
+    /* Labels next to inputs / sliders — small, muted */
+    .ctl-label {
+      color: var(--text-muted);
+      font-family: var(--font-sans);
+      font-size: 0.74rem;
+      letter-spacing: 0.02em;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
     }
     .ctl-divider {
       width: 1px;
       height: 18px;
-      background: #2a2a2a;
+      background: var(--border-subtle);
       margin: 0 4px;
     }
-    button {
-      background: #222;
-      color: #ccc;
-      border: 1px solid #444;
-      padding: 5px 12px;
-      cursor: pointer;
-      font-family: monospace;
-      font-size: 0.82rem;
-      border-radius: 3px;
-      min-height: 28px;
-      white-space: nowrap;
-    }
-    button:hover { background: #333; }
-    button:disabled { opacity: 0.35; cursor: not-allowed; }
-    button:disabled:hover { background: #222; }
-    button.active {
-      background: #2a1200;
-      border-color: #ff7700;
-      color: #ff9944;
-    }
-    button.active:hover { background: #3a1800; }
-    #rec-btn { min-width: 82px; }
-    button.recording {
-      background: #1a0000;
-      border-color: #cc0000;
-      color: #ff4444;
-      animation: blink 1.2s ease-in-out infinite;
-    }
-    button.recording:hover { background: #2a0000; }
-    @keyframes blink {
-      0%, 100% { opacity: 1; }
-      50%       { opacity: 0.55; }
-    }
-    /* Game-mode button — visually isolated so users don't misclick into
-       it. Distinct color, lower visual weight, separate row, right-aligned. */
-    #game-btn {
-      background: #0e1a14;
-      border-color: #2c5040;
-      color: #6fb59a;
-      letter-spacing: 0.04em;
-    }
-    #game-btn:hover { background: #14241c; border-color: #3c6a55; }
-    #game-btn.active {
-      background: #1a2b22;
-      border-color: #5edca0;
-      color: #b6f0d3;
-    }
-    .game-row {
-      display: flex;
-      justify-content: flex-end;
-      width: min(100%, 1400px);
-      margin-top: 2px;
-      padding-top: 6px;
-      border-top: 1px dashed #1c1c1c;
-    }
-    .game-row .game-label {
-      color: #444;
-      font-size: 0.7rem;
-      margin-right: 8px;
-      align-self: center;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-    /* Burn iters + seed inputs — match button styling */
-    #burn-iters, #seed-input {
-      background: #1a1a1a;
-      color: #ccc;
-      border: 1px solid #444;
-      padding: 5px 6px;
-      font-family: monospace;
-      font-size: 0.82rem;
-      border-radius: 3px;
-      width: 90px;
-      min-height: 28px;
-    }
-    #seed-input { width: 80px; }
-    .ctl-label {
-      color: #777;
-      font-size: 0.75rem;
-      letter-spacing: 0.04em;
-    }
-    /* Inline drip-config sliders, shown only when Drip is on */
+
+    /* Inline slider rows (drip / noise / hydro params) */
     .inline-sliders {
       display: none;
-      gap: 12px;
+      gap: 10px;
       align-items: center;
-      color: #888;
-      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-family: var(--font-sans);
+      font-size: 0.72rem;
+      flex-wrap: wrap;
+      width: 100%;
     }
     .inline-sliders.shown { display: inline-flex; }
-    .inline-sliders label { display: inline-flex; align-items: center; gap: 5px; }
-    .inline-sliders input[type=range] { width: 70px; accent-color: #666; }
-    .inline-sliders .val { color: #aaa; min-width: 38px; text-align: right; }
-    /* Hint row — small, dim, wraps cleanly under the controls */
-    .hint-row {
-      color: #4a4a4a;
-      font-size: 0.7rem;
-      max-width: min(100%, 1300px);
-      text-align: center;
-      line-height: 1.5;
-      padding: 0 12px;
+    .inline-sliders label { display: inline-flex; align-items: center; gap: 6px; }
+    .inline-sliders .val {
+      color: var(--text-bright);
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      min-width: 38px;
+      text-align: right;
     }
-    .hint-row kbd {
-      background: #181818;
-      border: 1px solid #2a2a2a;
+
+    /* ── Sliders ──────────────────────────────────────────────────────── */
+    input[type=range] {
+      -webkit-appearance: none;
+      appearance: none;
+      background: transparent;
+      height: 18px;
+      width: 80px;
+      cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-runnable-track {
+      height: 3px;
+      background: var(--surface-3);
       border-radius: 2px;
-      padding: 0 4px;
-      color: #888;
-      font-family: monospace;
     }
-    /* Slider row — bottom of the control bar */
+    input[type=range]::-moz-range-track {
+      height: 3px;
+      background: var(--surface-3);
+      border-radius: 2px;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      background: var(--c-primary);
+      box-shadow: 0 0 8px rgba(212, 166, 79, 0.45);
+      margin-top: -5px;
+      cursor: pointer;
+      transition: transform 0.12s var(--ease), box-shadow 0.12s var(--ease);
+    }
+    input[type=range]::-moz-range-thumb {
+      width: 13px;
+      height: 13px;
+      border: none;
+      border-radius: 50%;
+      background: var(--c-primary);
+      box-shadow: 0 0 8px rgba(212, 166, 79, 0.45);
+      cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb:hover {
+      transform: scale(1.20);
+      box-shadow: 0 0 12px rgba(212, 166, 79, 0.65);
+    }
+    /* Domain-tinted slider thumbs: noise sliders pink, hydrolysis aqua, etc. */
+    #noise-sliders   input[type=range]::-webkit-slider-thumb { background: var(--c-mutation);   box-shadow: 0 0 8px rgba(201, 125, 247, 0.50); }
+    #noise-sliders   input[type=range]::-moz-range-thumb     { background: var(--c-mutation);   box-shadow: 0 0 8px rgba(201, 125, 247, 0.50); }
+    #hydro-sliders   input[type=range]::-webkit-slider-thumb { background: var(--c-hydrolysis); box-shadow: 0 0 8px rgba(77, 217, 232, 0.50); }
+    #hydro-sliders   input[type=range]::-moz-range-thumb     { background: var(--c-hydrolysis); box-shadow: 0 0 8px rgba(77, 217, 232, 0.50); }
+    #drip-sliders    input[type=range]::-webkit-slider-thumb { background: var(--c-water);      box-shadow: 0 0 8px rgba(102, 204, 255, 0.50); }
+    #drip-sliders    input[type=range]::-moz-range-thumb     { background: var(--c-water);      box-shadow: 0 0 8px rgba(102, 204, 255, 0.50); }
+
+    /* Big physics-slider row (speed / soup / damp) — gets a bit more space */
     .sliders {
       display: flex;
-      gap: 18px;
+      gap: 16px;
       align-items: center;
-      font-size: 0.8rem;
-      color: #aaa;
+      flex-wrap: wrap;
     }
     .sliders label {
-      display: flex;
+      display: inline-flex;
       align-items: center;
-      gap: 6px;
+      gap: 7px;
+      font-family: var(--font-sans);
+      font-size: 0.78rem;
+      color: var(--text-muted);
     }
-    .sliders input[type=range] {
-      width: 90px;
-      accent-color: #666;
-    }
+    .sliders input[type=range] { width: 110px; }
     .sliders .val {
-      color: #666;
+      color: var(--text-bright);
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
       min-width: 36px;
       text-align: right;
     }
-    /* Status line — slightly more prominent so action feedback is visible */
-    #status {
-      font-size: 0.72rem;
-      color: #777;
-      letter-spacing: 0.04em;
-      min-height: 1.2em;
-      transition: color 0.2s ease;
-    }
-    #status.flash { color: #ddd; }
 
-    /* ── Mobile / touch responsive layout ─────────────────────────────────
-       Activated on narrow viewports OR coarse-pointer devices (touch).
-       Goal: keep the canvas visible and central, allow the control bar
-       to collapse, give every button a 44+px tap target. Desktop layout
-       is untouched. */
+    /* ── Mobile: hamburger toggle visible only on narrow / coarse-pointer */
     .ctl-toggle { display: none; }
+
+    /* ── Hint row — keyboard shortcuts strip ───────────────────────────── */
+    .hint-row {
+      color: var(--text-faint);
+      font-family: var(--font-sans);
+      font-size: 0.70rem;
+      max-width: min(100%, 1300px);
+      text-align: center;
+      line-height: 1.7;
+      padding: 4px 12px;
+      letter-spacing: 0.01em;
+    }
+    .hint-row kbd {
+      background: var(--surface-2);
+      border: 1px solid var(--border-subtle);
+      border-radius: 3px;
+      padding: 1px 5px;
+      color: var(--text-default);
+      font-family: var(--font-mono);
+      font-size: 0.82em;
+      box-shadow: 0 1px 0 var(--border-emph);
+      margin: 0 1px;
+    }
+
+    /* ──────────────────────────────────────────────────────────────────
+       MOBILE — ≤900px viewport OR coarse-pointer device.
+       Cards stack to a single column. Hamburger toggle expands the rest. */
     @media (max-width: 900px), (pointer: coarse) {
       body {
-        padding: 4px;
-        gap: 6px;
-        /* Allow vertical scroll if the control bar plus canvas overflow */
-        min-height: 100vh;
+        padding: 8px 6px 24px;
+        gap: var(--gap-snug);
         justify-content: flex-start;
       }
-      .title-block { padding: 4px 0; }
-      .title-block h1 { font-size: 1rem; }
-      .title-block small { font-size: 0.6rem; line-height: 1.5; }
-      /* Canvas fills available width; height scales by aspect ratio */
+      .title-block h1 { font-size: 1.1rem; letter-spacing: 0.32em; padding-left: 0.32em; }
+      .title-block small { font-size: 0.58rem; }
       .scope-frame {
         width: 100% !important;
         max-width: 100vw;
@@ -299,85 +597,68 @@
         height: auto !important;
         aspect-ratio: 1400 / 800;
         display: block;
-        touch-action: none; /* let our touch handlers fully control the gestures */
+        touch-action: none;
+        border-radius: 4px;
       }
-      /* Bigger tap targets — Apple HIG calls for ≥44px */
+      .scope-frame canvas#overlay { border-radius: 4px; }
+      .scope-frame::after { border-radius: 4px; }
+
       button {
-        min-height: 40px;
-        min-width: 40px;
-        padding: 8px 12px;
-        font-size: 0.82rem;
+        min-height: 38px;
+        padding: 9px 14px;
+        font-size: 0.84rem;
       }
-      input[type=range] {
-        min-height: 36px;
-      }
-      input[type=number], #burn-iters, #seed-input {
-        min-height: 36px;
-        font-size: 0.85rem;
-      }
-      /* Show the toggle, collapse the control bar by default. The user
-         can expand to see all rows. Critical actions (pause, view, brush
-         picker) stay always visible via the toggle button row. */
+      input[type=range] { min-height: 32px; }
+      #burn-iters, #seed-input { min-height: 36px; font-size: 0.86rem; }
+
       .ctl-toggle {
         display: inline-flex;
-        background: #1a1a1a;
-        border: 1px solid #444;
-        border-radius: 4px;
-        padding: 8px 14px;
-        color: #ddd;
-        font-family: monospace;
-        font-size: 0.82rem;
+        background: var(--surface-2);
+        border: 1px solid var(--border-emph);
+        border-radius: var(--r-md);
+        padding: 9px 16px;
+        color: var(--text-bright);
+        font-family: var(--font-sans);
+        font-size: 0.84rem;
+        font-weight: 500;
         cursor: pointer;
         margin: 4px 0;
-        min-height: 44px;
+        min-height: 42px;
         align-items: center;
-        gap: 6px;
+        gap: 8px;
       }
+      .ctl-toggle:hover { background: var(--surface-3); }
+
       .control-bar {
-        gap: 4px;
+        grid-template-columns: 1fr;
+        gap: var(--gap-snug);
       }
-      .control-bar.collapsed > .ctl-row,
-      .control-bar.collapsed > .game-row,
+      .control-bar.collapsed > .card,
       .control-bar.collapsed > .hint-row {
         display: none;
       }
-      .control-bar.collapsed > .ctl-row.always-visible {
+      .control-bar.collapsed > .card.always-visible {
         display: flex;
       }
-      .ctl-row {
-        gap: 6px;
-        padding: 0 4px;
-      }
-      .ctl-divider { display: none; }
-      .ctl-group { gap: 4px; }
-      .game-row {
-        flex-wrap: wrap;
-        justify-content: center;
-        padding-top: 4px;
-      }
-      .hint-row {
-        font-size: 0.65rem;
-        line-height: 1.6;
-      }
-      /* Hide the keyboard-shortcut hint row on touch — meaningless without
-         a keyboard. We render an alternate touch-tip when collapsed. */
       .hint-row { display: none; }
-      .inline-sliders {
-        flex-wrap: wrap;
-        font-size: 0.72rem;
-      }
-      .inline-sliders input[type=range] { width: 90px; }
-      /* Game overlay — bigger text on small screens for readability */
-      #game-overlay-title { font-size: 1.6rem; }
-      #game-overlay-sub { font-size: 0.85rem; }
+      .inline-sliders { font-size: 0.72rem; }
+      .inline-sliders input[type=range] { width: 100px; }
+      #game-overlay-title { font-size: 1.7rem; }
+      #game-overlay-sub   { font-size: 0.85rem; }
     }
   </style>
 </head>
 <body>
   <div class="title-block">
     <h1>PRIMORDIUM</h1>
-    <small>by David Castro · based on <a href="https://github.com/timhutton/squirm3" target="_blank" rel="noopener" style="color:#888">Squirm3</a> by Tim Hutton (2007) · <a href="LICENSE" target="_blank" rel="noopener" style="color:#888">GPL v3</a></small>
+    <small>
+      An artificial chemistry simulator by David Castro · based on
+      <a href="https://github.com/timhutton/squirm3" target="_blank" rel="noopener">Squirm3</a>
+      by Tim Hutton (2007) ·
+      <a href="LICENSE" target="_blank" rel="noopener">GPL v3</a>
+    </small>
   </div>
+
   <div id="scope-frame" class="scope-frame">
     <canvas id="canvas"></canvas>
     <canvas id="overlay"></canvas>
@@ -386,154 +667,159 @@
       <div id="game-overlay-sub"></div>
     </div>
   </div>
+
   <div id="status">booting…</div>
+
   <button class="ctl-toggle" id="ctl-toggle" aria-label="Toggle controls">☰ Controls</button>
+
   <div class="control-bar" id="control-bar">
 
-    <!-- Row 1: simulation tools (view + brushes + lysin) — always visible
-         on mobile because these are the most-used per-tap actions. -->
-    <div class="ctl-row always-visible">
-      <div class="ctl-group">
+    <!-- VIEW & PLAYBACK — always visible on mobile -->
+    <div class="card card--view always-visible">
+      <div class="card__label">View · Playback</div>
+      <div class="card__row">
         <button id="pause-btn">Pause</button>
         <button id="view-btn">View: Educational</button>
+        <button id="rec-btn">● REC</button>
       </div>
-      <div class="ctl-divider"></div>
-      <div class="ctl-group">
-        <button id="soup-brush-btn">🖌 Soup brush</button>
-        <button id="water-brush-btn">💧 Water brush</button>
+    </div>
+
+    <!-- BRUSHES — primary tools, always visible on mobile -->
+    <div class="card card--brushes always-visible">
+      <div class="card__label">Brushes · Tools</div>
+      <div class="card__row">
+        <button id="soup-brush-btn">🖌 Soup</button>
+        <button id="water-brush-btn">💧 Water</button>
         <button id="clear-water-btn">Clear water</button>
+      </div>
+      <div class="card__row">
         <button id="select-btn">🎯 Select atom</button>
         <button id="lysin-btn">Lysin: OFF</button>
       </div>
     </div>
 
-    <!-- Row 2: passive replenishment + fast-forward + record -->
-    <div class="ctl-row">
-      <div class="ctl-group">
+    <!-- WORLD — replenishment + fast-forward + reseed -->
+    <div class="card card--world">
+      <div class="card__label">World · Replenishment</div>
+      <div class="card__row">
         <button id="drip-btn">💧 Drip: OFF</button>
         <span class="inline-sliders" id="drip-sliders">
           <label>soup
             <input type="range" id="drip-soup-slider" min="100" max="3000" value="700" step="50">
-            <span class="val" id="drip-soup-val">700</span> tk
+            <span class="val" id="drip-soup-val">700</span>tk
           </label>
           <label>water
             <input type="range" id="drip-water-slider" min="500" max="15000" value="4250" step="100">
-            <span class="val" id="drip-water-val">4250</span> tk
+            <span class="val" id="drip-water-val">4250</span>tk
           </label>
         </span>
       </div>
-      <div class="ctl-divider"></div>
-      <div class="ctl-group">
+      <div class="card__row">
         <span class="ctl-label">⏩ Burn</span>
         <input id="burn-iters" type="number" value="100000" min="1000" step="10000">
         <span class="ctl-label">iters</span>
         <button id="burn-btn">Start</button>
       </div>
-      <div class="ctl-divider"></div>
-      <button id="rec-btn">● REC</button>
-    </div>
-
-    <!-- Row 3: thermodynamics sliders -->
-    <div class="ctl-row sliders">
-      <label>speed
-        <input type="range" id="speed-slider" min="1" max="30" value="8">
-        <span class="val" id="speed-val">8</span>
-      </label>
-      <label>soup
-        <input type="range" id="soup-slider" min="0" max="100" value="60">
-        <span class="val" id="soup-val">60%</span>
-      </label>
-      <label>damp
-        <input type="range" id="damp-slider" min="50" max="100" value="100">
-        <span class="val" id="damp-val">1.00</span>
-      </label>
-    </div>
-
-    <!-- Row 3.5: research-instrument tools — seed, save/load, CSV stats.
-         These don't disrupt the sim; they let you reproduce, archive, and
-         export data for actual experiments. -->
-    <div class="ctl-row">
-      <div class="ctl-group">
+      <div class="card__row">
         <span class="ctl-label">🎲 seed</span>
         <input id="seed-input" type="number" value="1" min="0" step="1">
         <button id="seed-apply-btn">Reseed</button>
       </div>
-      <div class="ctl-divider"></div>
-      <div class="ctl-group">
-        <button id="save-btn">💾 Save</button>
-        <button id="load-btn">📂 Load</button>
-      </div>
-      <div class="ctl-divider"></div>
-      <div class="ctl-group">
-        <span class="ctl-label">📊 stats</span>
-        <button id="csv-btn">Download CSV</button>
-        <button id="csv-clear-btn">Clear</button>
-        <span id="csv-count" class="ctl-label">0 rows</span>
+    </div>
+
+    <!-- PHYSICS — thermodynamic sliders -->
+    <div class="card card--physics">
+      <div class="card__label">Physics</div>
+      <div class="card__row sliders">
+        <label>speed
+          <input type="range" id="speed-slider" min="1" max="30" value="8">
+          <span class="val" id="speed-val">8</span>
+        </label>
+        <label>soup
+          <input type="range" id="soup-slider" min="0" max="100" value="60">
+          <span class="val" id="soup-val">60%</span>
+        </label>
+        <label>damp
+          <input type="range" id="damp-slider" min="50" max="100" value="100">
+          <span class="val" id="damp-val">1.00</span>
+        </label>
       </div>
     </div>
 
-    <!-- Row 3.6: NOISE PANEL — primitive-level mutation sources. All four
-         sliders independent, all default to zero. Toggle gates the whole
-         panel so reproducibility is preserved when noise is OFF. -->
-    <div class="ctl-row">
-      <div class="ctl-group">
+    <!-- MUTATION LAB — noise sources -->
+    <div class="card card--mutation">
+      <div class="card__label">Mutation Lab</div>
+      <div class="card__row">
         <button id="noise-btn">🧬 Noise: OFF</button>
-        <span class="inline-sliders" id="noise-sliders">
-          <label>copy
-            <input type="range" id="noise-copy-slider" min="0" max="1000" value="0" step="1">
-            <span class="val" id="noise-copy-val">0</span>
-          </label>
-          <label>decay
-            <input type="range" id="noise-decay-slider" min="0" max="1000" value="0" step="1">
-            <span class="val" id="noise-decay-val">0</span>
-          </label>
-          <label>bond
-            <input type="range" id="noise-bond-slider" min="0" max="1000" value="0" step="1">
-            <span class="val" id="noise-bond-val">0</span>
-          </label>
-        </span>
       </div>
-      <div class="ctl-divider"></div>
-      <div class="ctl-group">
+      <span class="inline-sliders" id="noise-sliders">
+        <label>copy
+          <input type="range" id="noise-copy-slider" min="0" max="1000" value="0" step="1">
+          <span class="val" id="noise-copy-val">0</span>
+        </label>
+        <label>decay
+          <input type="range" id="noise-decay-slider" min="0" max="1000" value="0" step="1">
+          <span class="val" id="noise-decay-val">0</span>
+        </label>
+        <label>bond
+          <input type="range" id="noise-bond-slider" min="0" max="1000" value="0" step="1">
+          <span class="val" id="noise-bond-val">0</span>
+        </label>
+      </span>
+    </div>
+
+    <!-- DECOMPOSITION — water-driven hydrolysis -->
+    <div class="card card--hydro">
+      <div class="card__label">Decomposition</div>
+      <div class="card__row">
+        <button id="hydro-btn">💧🧪 Hydrolysis: OFF</button>
+      </div>
+      <span class="inline-sliders" id="hydro-sliders">
+        <label>rate
+          <input type="range" id="hydro-rate-slider" min="0" max="1000" value="500" step="1">
+          <span class="val" id="hydro-rate-val">1.0</span>×
+        </label>
+        <label>density
+          <input type="range" id="hydro-density-slider" min="1" max="100" value="10" step="1">
+          <span class="val" id="hydro-density-val">0.0010</span>
+        </label>
+      </span>
+    </div>
+
+    <!-- ARCHIVE — saves, loads, exports -->
+    <div class="card card--archive">
+      <div class="card__label">Archive · Export</div>
+      <div class="card__row">
+        <button id="save-btn">💾 Save</button>
+        <button id="load-btn">📂 Load</button>
+      </div>
+      <div class="card__row">
+        <span class="ctl-label">📊 stats</span>
+        <button id="csv-btn">CSV</button>
+        <button id="csv-clear-btn">Clear</button>
+        <span id="csv-count" class="ctl-label">0 rows</span>
+      </div>
+      <div class="card__row">
         <span class="ctl-label">📜 events</span>
-        <button id="events-dl-btn">Download CSV</button>
+        <button id="events-dl-btn">CSV</button>
         <button id="events-clear-btn">Clear</button>
         <span id="events-count" class="ctl-label">0 events</span>
       </div>
     </div>
 
-    <!-- Row 3.7: HYDROLYSIS PANEL — water-driven decomposition. When ON,
-         water atoms ('w') are generated inside droplets and chemically
-         decompose nearby non-protected bonds. Default OFF preserves the
-         base sim bit-identically. -->
-    <div class="ctl-row">
-      <div class="ctl-group">
-        <button id="hydro-btn">💧🧪 Hydrolysis: OFF</button>
-        <span class="inline-sliders" id="hydro-sliders">
-          <label>rate
-            <input type="range" id="hydro-rate-slider" min="0" max="1000" value="500" step="1">
-            <span class="val" id="hydro-rate-val">1.0</span>×
-          </label>
-          <label>density
-            <input type="range" id="hydro-density-slider" min="1" max="100" value="10" step="1">
-            <span class="val" id="hydro-density-val">0.0010</span>
-          </label>
-        </span>
+    <!-- PLAY MODE — distinct alive-green card -->
+    <div class="card card--game">
+      <div class="card__label">Play Mode</div>
+      <div class="card__row">
+        <button id="game-btn">🦠 Steer a microbe</button>
       </div>
     </div>
 
-    <!-- Row 4: GAME MODE — isolated, right-aligned, separate visual band so
-         users don't misclick into a sim-disrupting mode change. -->
-    <div class="game-row">
-      <span class="game-label">play mode</span>
-      <button id="game-btn">🦠 Steer a microbe</button>
-    </div>
-
-    <!-- Row 5: keybindings hint, dim and small -->
+    <!-- Hint row — desktop only -->
     <div class="hint-row">
       <kbd>drag</kbd> pan · <kbd>wheel</kbd> zoom ·
       <kbd>Space</kbd> pause · <kbd>V</kbd> view ·
-      <kbd>B</kbd> soup brush · <kbd>W</kbd> water brush ·
+      <kbd>B</kbd> soup · <kbd>W</kbd> water ·
       <kbd>C</kbd> clear water · <kbd>P</kbd> lysin ·
       <kbd>R</kbd> record · <kbd>G</kbd> play mode ·
       <kbd>N</kbd> noise · <kbd>H</kbd> hydrolysis ·
@@ -541,6 +827,7 @@
       <kbd>Esc</kbd> back to pan
     </div>
   </div>
+
   <script src="dist/bundle.js"></script>
 </body>
 </html>
