@@ -63,11 +63,32 @@ const MAX_ZOOM = 6;
 let dragging = false;
 let lastMx = 0, lastMy = 0;
 
-function screenToWorld(clientX: number, clientY: number): { x: number; y: number } {
+// Canvas internal-pixel offset from a viewport client coordinate.
+// CRITICAL: on mobile (and any case where CSS scales the canvas), the
+// display rect is smaller than canvas.width / canvas.height. Touch events
+// give clientX in CSS pixels, but the camera math operates in canvas
+// internal pixels. Without this scaling, drag/brush land at the wrong
+// position because we'd be feeding CSS pixels into a transform expecting
+// canvas pixels. On desktop the scale is 1 (display === internal) so
+// behavior is unchanged.
+function clientToCanvas(clientX: number, clientY: number): { x: number; y: number } {
   const rect = canvas.getBoundingClientRect();
-  const sx = clientX - rect.left;
-  const sy = clientY - rect.top;
-  return { x: sx / camera.zoom + camera.x, y: sy / camera.zoom + camera.y };
+  const sx = (clientX - rect.left) * (canvas.width  / rect.width);
+  const sy = (clientY - rect.top)  * (canvas.height / rect.height);
+  return { x: sx, y: sy };
+}
+function screenToWorld(clientX: number, clientY: number): { x: number; y: number } {
+  const c = clientToCanvas(clientX, clientY);
+  return { x: c.x / camera.zoom + camera.x, y: c.y / camera.zoom + camera.y };
+}
+// Convert a client-pixel delta (e.g., dx from a drag) to a world-units
+// delta. Same scale correction as above; equals delta/zoom on desktop.
+function clientDeltaToWorld(dx: number, dy: number): { dx: number; dy: number } {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    dx: dx * (canvas.width  / rect.width)  / camera.zoom,
+    dy: dy * (canvas.height / rect.height) / camera.zoom,
+  };
 }
 
 function applyBrushAt(clientX: number, clientY: number): void {
@@ -95,9 +116,9 @@ canvas.addEventListener('mousedown', (e) => {
 window.addEventListener('mousemove', (e) => {
   if (!dragging) return;
   if (brushMode === 'pan') {
-    const dx = e.clientX - lastMx, dy = e.clientY - lastMy;
-    camera.x -= dx / camera.zoom;
-    camera.y -= dy / camera.zoom;
+    const d = clientDeltaToWorld(e.clientX - lastMx, e.clientY - lastMy);
+    camera.x -= d.dx;
+    camera.y -= d.dy;
     lastMx = e.clientX; lastMy = e.clientY;
   } else {
     // For continuous brushing, fire on each move event. Water gets one droplet
@@ -119,15 +140,13 @@ canvas.style.cursor = 'grab';
 // Mouse wheel → zoom around cursor
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
-  const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
-  const worldX = mx / camera.zoom + camera.x;
-  const worldY = my / camera.zoom + camera.y;
+  const c = clientToCanvas(e.clientX, e.clientY);
+  const worldX = c.x / camera.zoom + camera.x;
+  const worldY = c.y / camera.zoom + camera.y;
   const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
   const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, camera.zoom * factor));
-  camera.x = worldX - mx / newZoom;
-  camera.y = worldY - my / newZoom;
+  camera.x = worldX - c.x / newZoom;
+  camera.y = worldY - c.y / newZoom;
   camera.zoom = newZoom;
 }, { passive: false });
 
@@ -167,9 +186,15 @@ canvas.addEventListener('touchstart', (e: TouchEvent) => {
     pinchStartZoom = camera.zoom;
     pinchStartCamX = camera.x;
     pinchStartCamY = camera.y;
-    const rect = canvas.getBoundingClientRect();
-    pinchStartMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
-    pinchStartMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+    // Convert pinch midpoint to canvas-internal pixel space so the
+    // anchor math in touchmove works regardless of CSS scale.
+    const midClient = {
+      x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+      y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
+    };
+    const c = clientToCanvas(midClient.x, midClient.y);
+    pinchStartMidX = c.x;
+    pinchStartMidY = c.y;
   }
   e.preventDefault();
 }, { passive: false });
@@ -182,7 +207,7 @@ canvas.addEventListener('touchmove', (e: TouchEvent) => {
     if (pinchStartDist > 0 && newDist > 0) {
       const scale = newDist / pinchStartDist;
       const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, pinchStartZoom * scale));
-      // Anchor the pinch midpoint world position so it stays under the fingers
+      // Both pinchStartMidX/Y and the formula are in canvas-internal pixels.
       const worldX = pinchStartMidX / pinchStartZoom + pinchStartCamX;
       const worldY = pinchStartMidY / pinchStartZoom + pinchStartCamY;
       camera.x = worldX - pinchStartMidX / newZoom;
@@ -192,9 +217,9 @@ canvas.addEventListener('touchmove', (e: TouchEvent) => {
   } else if (activeGesture === 'single' && e.touches.length === 1 && dragging) {
     const t = e.touches[0];
     if (brushMode === 'pan') {
-      const dx = t.clientX - lastMx, dy = t.clientY - lastMy;
-      camera.x -= dx / camera.zoom;
-      camera.y -= dy / camera.zoom;
+      const d = clientDeltaToWorld(t.clientX - lastMx, t.clientY - lastMy);
+      camera.x -= d.dx;
+      camera.y -= d.dy;
       lastMx = t.clientX; lastMy = t.clientY;
     } else {
       const dx = t.clientX - lastMx, dy = t.clientY - lastMy;
