@@ -1136,17 +1136,74 @@ function isMobileLayout(): boolean {
   // Same condition as the @media query — narrow OR coarse pointer.
   return window.matchMedia('(max-width: 900px), (pointer: coarse)').matches;
 }
+// The legacy below-canvas hamburger toggle is no longer the primary
+// control opener — the new floating panel takes over. Keep this wired
+// only as a no-op safety net so removing the element doesn't break older
+// cached HTML during deploy transitions.
 if (ctlToggle && controlBar) {
-  // Start collapsed on mobile so the canvas is the focal element.
-  if (isMobileLayout()) controlBar.classList.add('collapsed');
   ctlToggle.addEventListener('click', () => {
     const collapsed = controlBar.classList.toggle('collapsed');
     ctlToggle.textContent = collapsed ? '☰ Controls' : '✕ Hide';
   });
-  // If the user resizes (e.g. rotation), keep the toggle state sensible.
-  window.addEventListener('resize', () => {
-    if (!isMobileLayout()) controlBar.classList.remove('collapsed');
-  });
+}
+
+// ── CONTROL PANEL — primary in-canvas overlay UI ─────────────────────────
+// Slides in from the right; overlays the canvas (canvas stays put, panel
+// covers right ~30% on desktop or the full screen on mobile). Designed
+// to STAY OPEN through every interaction so the user can switch brushes,
+// adjust sliders, toggle modes, and brush on the canvas without ever
+// having to reopen. Closes only on explicit dismiss: × button, M key,
+// Esc, or backdrop tap on mobile.
+//
+// Defensive: every querySelector is null-checked, every localStorage call
+// is wrapped in try/catch, key handlers ignore typing in inputs.
+
+const PANEL_STATE_KEY = 'primordium-panel-open-v1';
+const menuToggleBtn = document.getElementById('menu-toggle')   as HTMLButtonElement | null;
+const panelCloseBtn = document.getElementById('panel-close')   as HTMLButtonElement | null;
+const controlPanel  = document.getElementById('control-panel') as HTMLElement | null;
+const panelBackdrop = document.getElementById('panel-backdrop') as HTMLDivElement | null;
+
+function isPanelOpen(): boolean {
+  return !!controlPanel && controlPanel.classList.contains('open');
+}
+function openPanel(): void {
+  if (!controlPanel) return;
+  controlPanel.classList.add('open');
+  controlPanel.setAttribute('aria-hidden', 'false');
+  if (panelBackdrop) panelBackdrop.classList.add('shown');
+  if (menuToggleBtn) menuToggleBtn.classList.add('active');
+  try { localStorage.setItem(PANEL_STATE_KEY, '1'); } catch { /* private mode etc. */ }
+}
+function closePanel(): void {
+  if (!controlPanel) return;
+  controlPanel.classList.remove('open');
+  controlPanel.setAttribute('aria-hidden', 'true');
+  if (panelBackdrop) panelBackdrop.classList.remove('shown');
+  if (menuToggleBtn) menuToggleBtn.classList.remove('active');
+  try { localStorage.setItem(PANEL_STATE_KEY, '0'); } catch { /* ignore */ }
+}
+function togglePanel(): void {
+  if (isPanelOpen()) closePanel(); else openPanel();
+}
+
+// Restore previous open/closed state. Default closed on first visit so
+// the simulation is the focal element for new users.
+try {
+  if (localStorage.getItem(PANEL_STATE_KEY) === '1') openPanel();
+} catch { /* private mode — leave closed */ }
+
+// Wire interactions
+if (menuToggleBtn) menuToggleBtn.addEventListener('click', togglePanel);
+if (panelCloseBtn) panelCloseBtn.addEventListener('click', closePanel);
+if (panelBackdrop) panelBackdrop.addEventListener('click', closePanel);
+
+// Stop touch/click events inside the panel from bubbling to the canvas
+// underneath (which would otherwise trigger brushing through the panel).
+if (controlPanel) {
+  const stop = (e: Event) => e.stopPropagation();
+  controlPanel.addEventListener('touchstart', stop, { passive: true });
+  controlPanel.addEventListener('mousedown',  stop);
 }
 
 // ── Orientation change → reload so canvas internal resolution swaps ───────
@@ -1206,6 +1263,14 @@ eventsClearBtn.addEventListener('click', clearEvents);
 recBtn.addEventListener('click', toggleRecording);
 
 document.addEventListener('keydown', (e) => {
+  // Ignore letter / bracket shortcuts when the user is typing in an input
+  // field (seed, burn iters). Otherwise typing 'b' in the seed input would
+  // fire the soup brush — a real footgun in the previous version.
+  const target = e.target as HTMLElement | null;
+  const isTyping = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || (target as HTMLElement).isContentEditable);
+  const isShortcutKey = /^Key[A-Z]$|^Bracket(Left|Right)$/.test(e.code);
+  if (isTyping && isShortcutKey) return;
+
   // In game mode, WASD is reserved for the player. We still allow other shortcuts.
   if (gameMode && (e.code === 'KeyW' || e.code === 'KeyA' || e.code === 'KeyS' || e.code === 'KeyD')) {
     if (e.code === 'KeyW') keyState.w = true;
@@ -1213,6 +1278,12 @@ document.addEventListener('keydown', (e) => {
     if (e.code === 'KeyS') keyState.s = true;
     if (e.code === 'KeyD') keyState.d = true;
     pushPlayerInput();
+    return;
+  }
+  // Esc: close the panel first if open, otherwise reset brush.
+  if (e.code === 'Escape') {
+    if (isPanelOpen()) { closePanel(); return; }
+    setBrush('pan');
     return;
   }
   if (e.code === 'Space') { e.preventDefault(); togglePause(); }
@@ -1225,10 +1296,10 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'KeyG')  { toggleGame(); }
   if (e.code === 'KeyN')  { toggleNoise(); }
   if (e.code === 'KeyH')  { toggleHydro(); }
+  if (e.code === 'KeyM')  { e.preventDefault(); togglePanel(); }
   if (e.code === 'BracketLeft')  { e.preventDefault(); quickSave(); }
   if (e.code === 'BracketRight') { e.preventDefault(); quickLoad(); }
   if (e.code === 'KeyF')         { e.preventDefault(); freezeAndCapture(); }
-  if (e.code === 'Escape') { setBrush('pan'); }
   if ((e.code === 'Delete' || e.code === 'Backspace') && brushMode === 'select') {
     e.preventDefault();
     send({ type: 'deleteSelected' });
