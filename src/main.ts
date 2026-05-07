@@ -1356,7 +1356,7 @@ function loop(): void {
       // already set by draw2DClassic.
       const z = camera.zoom;
       overlayCtx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
-      drawArenaBorder(overlayCtx, GRID_W, GRID_H, z, 'classic');
+      drawArenaBorder(overlayCtx, GRID_W, GRID_H, z);
     } else if (useGPU) {
       drawGPU(snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
       // Reset the overlay transform before clearing — clearRect honors the
@@ -1370,7 +1370,7 @@ function loop(): void {
       // physical edges of the simulation zone.
       const z = camera.zoom;
       overlayCtx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
-      drawArenaBorder(overlayCtx, GRID_W, GRID_H, z, 'default');
+      drawArenaBorder(overlayCtx, GRID_W, GRID_H, z);
       overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
       if (viewMode === 'educational') drawHUD2D(overlayCtx, snap.iterations, snap.atomCount, snap.atoms);
     } else if (ctx2d) {
@@ -1380,7 +1380,7 @@ function loop(): void {
       // change that contract.
       const z = camera.zoom;
       ctx2d.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
-      drawArenaBorder(ctx2d, GRID_W, GRID_H, z, 'default');
+      drawArenaBorder(ctx2d, GRID_W, GRID_H, z);
       if (viewMode === 'educational') {
         // HUD always in screen space — reset transform first
         ctx2d.setTransform(1, 0, 0, 1, 0, 0);
