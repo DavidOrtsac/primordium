@@ -22,8 +22,14 @@ import { initGPU, drawGPU } from './renderer-gpu';
 // we render only what the camera sees. Pan with mouse drag, zoom with wheel.
 const GRID_W = 5000;
 const GRID_H = 3000;
-const VIEW_W = 1400;
-const VIEW_H = 800;
+// Canvas internal resolution. Default landscape (1400×800) for desktop. On
+// mobile portrait we swap to portrait (800×1400) so the canvas naturally
+// uses the available vertical real estate of the phone screen. The arena
+// (GRID_W × GRID_H) doesn't change — the camera just frames a different
+// shape of window into it.
+const _isMobilePortrait = window.matchMedia('(max-width: 900px) and (orientation: portrait), (pointer: coarse) and (orientation: portrait)').matches;
+const VIEW_W = _isMobilePortrait ? 800 : 1400;
+const VIEW_H = _isMobilePortrait ? 1400 : 800;
 
 // ── Canvases ────────────────────────────────────────────────────────────────
 const canvas  = document.getElementById('canvas')  as HTMLCanvasElement;
@@ -1112,6 +1118,59 @@ if (ctlToggle && controlBar) {
     if (!isMobileLayout()) controlBar.classList.remove('collapsed');
   });
 }
+
+// ── Orientation change → reload so canvas internal resolution swaps ───────
+// Switching VIEW_W/VIEW_H mid-flight would require recreating the WebGPU
+// pipeline, the 2D context, the camera, and the snapshot pool. A page
+// reload achieves the same end state with zero edge cases. Only triggers
+// on actual orientation flip, not every resize, so it's quiet on desktop.
+let _lastIsPortrait = window.matchMedia('(orientation: portrait)').matches;
+window.addEventListener('resize', () => {
+  if (!isMobileLayout()) return;
+  const nowPortrait = window.matchMedia('(orientation: portrait)').matches;
+  if (nowPortrait !== _lastIsPortrait) {
+    // Debounce a moment so iOS doesn't fire mid-rotation.
+    setTimeout(() => location.reload(), 250);
+  }
+});
+
+// ── Fullscreen toggle (works on iPhone via CSS pseudo-fullscreen) ─────────
+// The Fullscreen API is unreliable on iPhone Safari (only <video> elements
+// can request true fullscreen). Pseudo-fullscreen via a body class hides
+// everything except the canvas frame and makes it fill 100vw/100vh —
+// works on every platform including iPhone PWA mode.
+const fsToggle = document.getElementById('fs-toggle') as HTMLButtonElement | null;
+function toggleFullscreen(): void {
+  const body = document.body;
+  const goingFs = !body.classList.contains('canvas-fullscreen');
+  // Try native fullscreen first (desktop, Android, iPad). If it works,
+  // great; if it fails (iPhone), the CSS class still gives us pseudo-FS.
+  if (goingFs) {
+    const el = document.getElementById('scope-frame');
+    if (el && (el as HTMLElement).requestFullscreen) {
+      (el as HTMLElement).requestFullscreen().catch(() => { /* fall through to CSS */ });
+    }
+    body.classList.add('canvas-fullscreen');
+    if (fsToggle) fsToggle.textContent = '✕';
+  } else {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => { /* ignore */ });
+    }
+    body.classList.remove('canvas-fullscreen');
+    if (fsToggle) fsToggle.textContent = '⛶';
+  }
+}
+if (fsToggle) {
+  fsToggle.addEventListener('click', toggleFullscreen);
+}
+// Sync the body class if user exits via Esc / native exit.
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && document.body.classList.contains('canvas-fullscreen')) {
+    // User exited native fullscreen. Drop pseudo-FS too.
+    document.body.classList.remove('canvas-fullscreen');
+    if (fsToggle) fsToggle.textContent = '⛶';
+  }
+});
 eventsDlBtn.addEventListener('click', downloadEventsCSV);
 eventsClearBtn.addEventListener('click', clearEvents);
 recBtn.addEventListener('click', toggleRecording);
