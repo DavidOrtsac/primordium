@@ -674,6 +674,28 @@ export function draw2DClassic(
   ctx.globalAlpha = 1;
 }
 
+// Draws the physical boundary of the simulation arena as a thin stroked
+// rectangle in WORLD coordinates. Caller is responsible for setting the
+// camera transform on `ctx` before calling — same convention as the rest
+// of the world-space renderers. Boundary uses a faint warm tone tuned so
+// it doesn't compete with atoms or membranes; line width scales inversely
+// with zoom so it's a constant visual thickness on screen at any zoom.
+export function drawArenaBorder(
+  ctx: CanvasRenderingContext2D, gridW: number, gridH: number, zoom: number,
+  variant: 'default' | 'classic' = 'default',
+): void {
+  const lineWidth = Math.max(0.6, 1.0 / zoom);
+  ctx.save();
+  ctx.lineWidth = lineWidth;
+  ctx.strokeStyle = variant === 'classic'
+    ? 'rgba(60, 60, 60, 0.55)'           // dark thin line on classic white
+    : 'rgba(212, 166, 79, 0.42)';        // warm gold, matches brand accent
+  ctx.shadowColor = variant === 'classic' ? 'transparent' : 'rgba(212, 166, 79, 0.18)';
+  ctx.shadowBlur = variant === 'classic' ? 0 : 6 / zoom;
+  ctx.strokeRect(0, 0, gridW, gridH);
+  ctx.restore();
+}
+
 export function drawHUD2D(ctx: CanvasRenderingContext2D, iterations: number, atomCount: number, atoms: Float32Array): void {
   let bonded = 0;
   for (let i = 0; i < atomCount; i++) {

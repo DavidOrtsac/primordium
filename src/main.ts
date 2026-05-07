@@ -15,7 +15,7 @@
 // No physics state lives here.
 
 import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, SaveState, STRIDE } from './snapshot';
-import { draw2D, draw2DClassic, drawHUD2D } from './renderer-2d';
+import { draw2D, draw2DClassic, drawHUD2D, drawArenaBorder } from './renderer-2d';
 import { initGPU, drawGPU } from './renderer-gpu';
 
 // Big arena (~13× the original area). The canvas itself is viewport-sized;
@@ -417,9 +417,12 @@ function toggleView(): void {
   // Microscope CSS effects only apply in microscope mode
   canvas.classList.toggle('microscope', viewMode === 'microscope');
   scopeFrame.classList.toggle('microscope', viewMode === 'microscope');
-  // Overlay holds the HUD (educational) and the whole classic render. Hide
-  // it only in microscope mode where the main canvas owns the visuals.
-  overlay.classList.toggle('hidden', viewMode === 'microscope');
+  // Overlay used to be hidden in microscope mode for visual cleanliness.
+  // Now the arena boundary lives on the overlay in every mode, so keep
+  // it visible. Microscope filter only applies to canvas#canvas, so the
+  // boundary on the overlay stays sharp and unfiltered, which reads as
+  // a clean HUD-style indicator over the blurred microscope view.
+  overlay.classList.remove('hidden');
   // Wipe the overlay on every mode change so a stale classic frame can't
   // bleed into educational/microscope before the next render fires.
   overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1348,6 +1351,12 @@ function loop(): void {
       // has a 2D context, regardless of whether main is WebGPU or 2D). The
       // overlay's opaque white fill covers whatever the main canvas last had.
       draw2DClassic(overlayCtx, snap.atoms, snap.atomCount, snap.bonds, snap.droplets, camera);
+      // Arena boundary — drawn last on top of the white classic surface.
+      // Uses a darker variant so it reads on white. Camera transform is
+      // already set by draw2DClassic.
+      const z = camera.zoom;
+      overlayCtx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+      drawArenaBorder(overlayCtx, GRID_W, GRID_H, z, 'classic');
     } else if (useGPU) {
       drawGPU(snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
       // Reset the overlay transform before clearing — clearRect honors the
@@ -1356,9 +1365,22 @@ function loop(): void {
       // of the overlay frozen on top of the live render beneath.
       overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
       overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+      // Arena boundary on the overlay (sits over the GPU output). Drawn
+      // in every view including microscope so the user always sees the
+      // physical edges of the simulation zone.
+      const z = camera.zoom;
+      overlayCtx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+      drawArenaBorder(overlayCtx, GRID_W, GRID_H, z, 'default');
+      overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
       if (viewMode === 'educational') drawHUD2D(overlayCtx, snap.iterations, snap.atomCount, snap.atoms);
     } else if (ctx2d) {
       draw2D(ctx2d, snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
+      // Arena boundary on the 2D fallback canvas. draw2D already set the
+      // camera transform; we set it again defensively in case future edits
+      // change that contract.
+      const z = camera.zoom;
+      ctx2d.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+      drawArenaBorder(ctx2d, GRID_W, GRID_H, z, 'default');
       if (viewMode === 'educational') {
         // HUD always in screen space — reset transform first
         ctx2d.setTransform(1, 0, 0, 1, 0, 0);
@@ -1392,11 +1414,9 @@ function drawSelectionHalo(snap: SnapshotMsg): void {
       break;
     }
   }
-  // If hidden by microscope CSS, force-unhide so the halo is visible during selection.
+  // The overlay is now always visible (arena boundary lives there), so
+  // we no longer need to toggle the `hidden` class for selection purposes.
   const microscope = viewMode === 'microscope';
-  if (microscope) {
-    overlay.classList.toggle('hidden', sx < 0); // hidden when nothing selected
-  }
   if (sx < 0) return;
 
   // Pick the right context. In the pure-2D view the overlay is empty and the
