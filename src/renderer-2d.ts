@@ -11,7 +11,7 @@ import { STRIDE, unpackType, unpackState } from './snapshot';
 // ── Visual constants ────────────────────────────────────────────────────────
 const COLORS: Record<string, string> = {
   e: '#ff3333', f: '#33ff33', b: '#888888', c: '#00dddd',
-  d: '#3366ff', p: '#ff7700',
+  d: '#3366ff', p: '#ff7700', w: '#66ccff',
 };
 
 const LEGEND: { color: string; label: string; isLine?: boolean }[] = [
@@ -399,8 +399,11 @@ export function draw2D(
       const flags = atoms[o + 3] | 0;
       const isMembrane = (flags & 4) !== 0;
       const state = unpackState(atoms[o + 2]);
-      if (state !== 0 || isMembrane) continue;
       const type = String.fromCharCode(unpackType(atoms[o + 2]));
+      // Water always renders via soup style regardless of state (fresh
+      // and spent water are the same molecule visually).
+      const isWater = type === 'w';
+      if ((state !== 0 && !isWater) || isMembrane) continue;
       const alpha = type === 'p' ? '55' : '1a';
       const key = (COLORS[type] ?? '#ff3333') + alpha;
       let arr = buckets.get(key);
@@ -524,9 +527,11 @@ export function draw2D(
       const flags = atoms[o + 3] | 0;
       const isMembrane = (flags & 4) !== 0;
       const state = unpackState(atoms[o + 2]);
-      if (state === 0 || isMembrane) continue;
-      const isBonded = (flags & 1) !== 0;
       const type = String.fromCharCode(unpackType(atoms[o + 2]));
+      // Water never renders via the organelle path. It's always small,
+      // soft, and water-colored regardless of state.
+      if (state === 0 || isMembrane || type === 'w') continue;
+      const isBonded = (flags & 1) !== 0;
       const isDense = type === 'd' || type === 'e' || type === 'f';
 
       const h = atomHash32(i, unpackType(atoms[o + 2]), state);
@@ -545,8 +550,11 @@ export function draw2D(
       const flags = atoms[o + 3] | 0;
       const isMembrane = (flags & 4) !== 0;
       const state = unpackState(atoms[o + 2]);
-      if (state === 0 || isMembrane) continue;
       const type = String.fromCharCode(unpackType(atoms[o + 2]));
+      // Water atoms always render via the soup-style path even at state>0
+      // (spent water). Skip them here so they don't get bumped into the
+      // large saturated organelle visual.
+      if (state === 0 || isMembrane || type === 'w') continue;
       const key = (COLORS[type] ?? '#ff3333') + 'cc';
       let arr = buckets.get(key);
       if (!arr) { arr = []; buckets.set(key, arr); }
@@ -577,7 +585,7 @@ export function draw2D(
 // on top of whatever the main canvas last rendered.
 const CLASSIC_COLORS: Record<string, string> = {
   a: '#c8a800', b: '#888888', c: '#00dddd', d: '#3366ff',
-  e: '#ff3333', f: '#33ff33', p: '#ff7700',
+  e: '#ff3333', f: '#33ff33', p: '#ff7700', w: '#a8d8ff',
 };
 
 export function draw2DClassic(

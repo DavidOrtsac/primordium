@@ -25,6 +25,7 @@ export type SnapshotMsg = {
   atomCount: number;
   epoch: number; // increments on grid reset — main thread uses this to flush EMA state
   atoms:    Float32Array;
+  atomIds:  Uint32Array;   // parallel to atoms: stable monotonic ID per atom (0 in unused slots)
   loops:    Uint32Array;
   bonds:    Uint32Array;
   droplets: Float32Array;  // [count, x, y, r, x, y, r, ...]
@@ -61,7 +62,10 @@ export type ControlMsg =
   | { type: 'selectAt'; x: number; y: number; radius: number }
   | { type: 'deselectAll' }
   | { type: 'deleteSelected' }
-  | { type: 'reuse'; atoms: Float32Array; loops: Uint32Array; bonds: Uint32Array; droplets: Float32Array };
+  | { type: 'setNoise'; enabled: boolean; copyFidelity: number; decayRate: number; bondFailRate: number }
+  | { type: 'setHydrolysis'; enabled: boolean; baseRate: number; waterDensity: number }
+  | { type: 'requestEventLog' }
+  | { type: 'reuse'; atoms: Float32Array; atomIds: Uint32Array; loops: Uint32Array; bonds: Uint32Array; droplets: Float32Array };
 
 // Serialized full simulation state for save/load round-trip. Designed so
 // loading is bit-identical (same seed + same RNG state + same atoms/bonds/
@@ -85,6 +89,20 @@ export type SaveState = {
   dripFeed: boolean;
   dripSoupInterval: number;
   dripWaterInterval: number;
+  // Noise config — preserved so a reproducible run replays the exact same
+  // mutation sequence. Optional for back-compat with v1 saves missing them.
+  noiseEnabled?: boolean;
+  noiseCopyFidelity?: number;
+  noiseDecayRate?: number;
+  noiseBondFailRate?: number;
+  // Hydrolysis config — same reproducibility logic. Water atoms ('w') are
+  // saved like any other atom in the cell arrays.
+  hydrolysisEnabled?: boolean;
+  hydrolysisBaseRate?: number;
+  hydrolysisWaterDensity?: number;
+  // Atom ID counter — restored so post-load creations don't collide with
+  // pre-save IDs. Optional for back-compat.
+  nextAtomId?: number;
   // Cells (parallel arrays for compact JSON)
   cellX:    number[];
   cellY:    number[];
@@ -94,6 +112,9 @@ export type SaveState = {
   cellState:  number[];
   cellEnergy: number[];
   cellPlayer: number[];      // 0/1
+  // Per-cell stable ID. Optional for back-compat with v1 saves; when
+  // missing, loader assigns fresh sequential IDs.
+  cellId?:    number[];
   // Bonds — flat [i0, j0, i1, j1, ...] with i < j
   bonds: number[];
   // Water droplets
@@ -128,6 +149,24 @@ export type BurnDoneMsg = {
   aborted: boolean;
 };
 
+// Chunk of noise events drained from the worker's ring buffer. Six
+// parallel Uint32Arrays keep wire format compact and transferable.
+// kinds: 0=copy_misfire, 1=decay, 2=bond_fail, 3=rule_flip(reserved).
+// before/after: packed (typeCharCode<<16)|state (atom events) or
+// 0/1 (bond events: 1=was bonded).
+export type EventLogChunkMsg = {
+  type: 'eventLogChunk';
+  n: number;
+  totalEverFired: number;
+  droppedSinceLast: number;
+  iters:  Uint32Array;
+  kinds:  Uint32Array;
+  atomA:  Uint32Array;
+  atomB:  Uint32Array;
+  before: Uint32Array;
+  after:  Uint32Array;
+};
+
 // Pack typeCharCode + state into a single f32 bit-pattern.
 // We use Uint32 bit reinterpretation through a tiny aliased view.
 const _packView   = new ArrayBuffer(4);
@@ -154,6 +193,9 @@ export const MAX_DROPLETS = 500;
 
 export function allocAtomsBuffer(): Float32Array {
   return new Float32Array(MAX_ATOMS * STRIDE);
+}
+export function allocAtomIdsBuffer(): Uint32Array {
+  return new Uint32Array(MAX_ATOMS);
 }
 export function allocLoopsBuffer(): Uint32Array {
   // Header (1) + per-loop header (2: vertCount, isPredator) * up to 2000 loops + verts

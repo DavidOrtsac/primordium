@@ -1,5 +1,7 @@
 import { Cell, RADIUS, MAX_VELOCITY } from './cell';
 import { Chemistry } from './chemistry';
+import { NoiseConfig, EventLog, DEFAULT_NOISE, applyDecaySweep } from './noise';
+import { HydrolysisConfig, DEFAULT_HYDROLYSIS, applyHydrolysisSweep } from './hydrolysis';
 
 const PHYS_RANGE = RADIUS * 2.0;
 const PHYS_RANGE2 = PHYS_RANGE * PHYS_RANGE;
@@ -66,14 +68,26 @@ export class Grid {
   protected chemistry = new Chemistry();
   private _iterations = 0;
   private _epoch = 0;
+  private _nextAtomId = 1;
   private readonly _nearby: Cell[] = [];
   private readonly _candidates: Cell[] = [];
 
+  // Noise + event log are owned by the worker, but Grid + Chemistry need
+  // refs so the per-tick decay sweep and per-reaction misfire hook can
+  // log and mutate. Default to disabled-config + a throwaway log so the
+  // grid is usable even before the worker wires real refs in.
+  noise: NoiseConfig = { ...DEFAULT_NOISE };
+  eventLog: EventLog = new EventLog(8); // tiny placeholder, replaced on init
+  // Hydrolysis config — same ownership pattern as noise.
+  hydrolysis: HydrolysisConfig = { ...DEFAULT_HYDROLYSIS };
+
   get iterations(): number { return this._iterations; }
   get epoch(): number { return this._epoch; }
+  get nextAtomId(): number { return this._nextAtomId; }
   // Save/load support — bypass the normal step()-driven counter so a
   // restored simulation reports the same iteration the save was taken at.
   setIterations(n: number): void { this._iterations = n | 0; }
+  setNextAtomId(n: number): void { this._nextAtomId = Math.max(1, n | 0); }
 
   create(width: number, height: number): void {
     this._epoch++;
@@ -92,7 +106,18 @@ export class Grid {
   getChemistry(): Chemistry { return this.chemistry; }
 
   createCell(x: number, y: number, type: string, state: number): Cell {
-    const cell = new Cell(x, y, type, state);
+    const cell = new Cell(x, y, type, state, this._nextAtomId++);
+    const [sx, sy] = this.slotOf(x, y);
+    this.slots[sx][sy].push(cell);
+    this.cells.push(cell);
+    return cell;
+  }
+
+  // Save/load: restore a cell with its original stable ID. Caller must
+  // separately update nextAtomId to (max saved id + 1) so subsequent
+  // creations don't collide.
+  createCellWithId(x: number, y: number, type: string, state: number, id: number): Cell {
+    const cell = new Cell(x, y, type, state, id);
     const [sx, sy] = this.slotOf(x, y);
     this.slots[sx][sy].push(cell);
     this.cells.push(cell);
@@ -120,7 +145,15 @@ export class Grid {
   }
 
   step(): void {
+    // Background decay runs BEFORE chemistry so its perturbations can
+    // immediately participate in the same tick's reactions — closer to a
+    // physical "atom got hit by radiation, then reacted" causal chain.
+    applyDecaySweep(this.noise, this.eventLog, this._iterations, this.cells);
     this.computeVelocitiesAndReact();
+    // Hydrolysis runs AFTER chemistry so any bonds just formed can be
+    // attacked this same tick if they're not in a live cell graph.
+    // Sweep is a no-op when hydrolysis is disabled (returns immediately).
+    applyHydrolysisSweep(this, this.hydrolysis, this.eventLog, this._iterations);
     this.moveCells();
     this._iterations++;
   }
@@ -153,6 +186,9 @@ export class Grid {
   // Hot-path count-only variant — avoids allocating a result array. Returns
   // exactly the same count getAllWithinRadius would produce. The inner-loop
   // crowding check only needs the count, never the cells themselves.
+  // Water atoms ('w') are excluded — they are chemical substrate, not
+  // chemistry participants, so they shouldn't inflate crowding scores
+  // and suppress real chemistry. This is correctness, not just perf.
   private countWithinRadius(x: number, y: number, r: number, capAt: number): number {
     const r2 = r * r;
     const [cx, cy] = this.slotOf(x, y);
@@ -163,6 +199,7 @@ export class Grid {
         const slot = this.slots[i][j];
         for (let k = 0; k < slot.length; k++) {
           const c = slot[k];
+          if (c.type === 'w') continue;
           const dx = c.loc.x - x;
           const dy = c.loc.y - y;
           if (dx * dx + dy * dy < r2) {
@@ -193,6 +230,9 @@ export class Grid {
     const allCells = this.cells;
     for (let i = 0; i < allCells.length; i++) {
       const c = allCells[i];
+      // Water atoms don't react via chemistry (only via hydrolysis sweep),
+      // so they don't need a crowding count. Skip the spatial query.
+      if (c.type === 'w') { c.crowdingCount = 0; continue; }
       c.crowdingCount = this.countWithinRadius(c.loc.x, c.loc.y, RADIUS * 1.5, 2);
     }
 
@@ -218,6 +258,10 @@ export class Grid {
         const snapshotLen = centralCells.length;
         for (let ci = 0; ci < snapshotLen; ci++) {
           const cell = centralCells[ci];
+          // Water atoms skip the entire force/chemistry pass. They never
+          // bond, never react, and never feel repulsion from other atoms.
+          // moveCells handles their thermal motion + droplet containment.
+          if (cell.type === 'w') continue;
           let fx = 0;
           let fy = 0;
           candidates.length = 0;
@@ -295,7 +339,7 @@ export class Grid {
           // a no-op; skipping saves ~47 wasted checks per free atom per step.
           if (cell.bonds.size > 0) {
             candidates.push(cell);
-            this.chemistry.react(cell, candidates, REACTION_RANGE2);
+            this.chemistry.react(cell, candidates, REACTION_RANGE2, this.noise, this.eventLog, this._iterations);
           }
         }
       }
@@ -379,6 +423,36 @@ export class Grid {
       // gets full Brownian motion if it's actually inside a water droplet.
       if (this.droplets.length > 0) {
         inDrop = this.dropletInfluence(cell.loc.x, cell.loc.y, dropOut);
+      }
+
+      // Water atoms are HARD-CLAMPED to stay inside the nearest droplet.
+      // Surface tension alone is "soft" and lets thermal motion push other
+      // atoms across the rim (intentional — leakage is realistic for soup).
+      // Water is the droplet, though — it shouldn't ever leave. We snap any
+      // escaped water back to just inside its parent droplet's boundary
+      // and reflect velocity inward so subsequent ticks don't re-escape.
+      if (cell.type === 'w' && !inDrop && this.droplets.length > 0) {
+        let nearestD = this.droplets[0];
+        let nearestDist2 = Infinity;
+        for (const d of this.droplets) {
+          const dx = cell.loc.x - d.x;
+          const dy = cell.loc.y - d.y;
+          const dist2 = dx * dx + dy * dy;
+          if (dist2 < nearestDist2) { nearestDist2 = dist2; nearestD = d; }
+        }
+        const dist = Math.sqrt(nearestDist2) || 0.0001;
+        const ux = (cell.loc.x - nearestD.x) / dist;
+        const uy = (cell.loc.y - nearestD.y) / dist;
+        const innerR = nearestD.r * 0.97; // 3% inside the rim
+        cell.loc.x = nearestD.x + ux * innerR;
+        cell.loc.y = nearestD.y + uy * innerR;
+        // Reflect velocity if it points outward (otherwise leave it).
+        const vDotN = cell.vel.x * ux + cell.vel.y * uy;
+        if (vDotN > 0) {
+          cell.vel.x -= 2 * vDotN * ux;
+          cell.vel.y -= 2 * vDotN * uy;
+        }
+        inDrop = true;
       }
 
       // Thermal: free atoms get the random Brownian kick. Outside water the

@@ -23,10 +23,12 @@ import { initSimple, buildCell, seedLysin, removeLysin, seedPredatorCells, remov
 import { initWild, generateRandomChemistry, wildTick } from './wild';
 import {
   ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg,
-  SaveState, SaveStateMsg, LoadResultMsg, STRIDE,
-  packTypeState, allocAtomsBuffer, allocLoopsBuffer, allocBondsBuffer, allocDropletsBuffer,
+  SaveState, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, STRIDE,
+  packTypeState, allocAtomsBuffer, allocAtomIdsBuffer, allocLoopsBuffer, allocBondsBuffer, allocDropletsBuffer,
   MAX_ATOMS, MAX_LOOP_VERTS_TOTAL, MAX_BONDS, MAX_DROPLETS,
 } from './snapshot';
+import { NoiseConfig, EventLog, DEFAULT_NOISE } from './noise';
+import { HydrolysisConfig, DEFAULT_HYDROLYSIS, generateWaterForDroplet, generateWaterForAllDroplets, removeAllWater } from './hydrolysis';
 
 // ── Seedable PRNG (mulberry32) ──────────────────────────────────────────────
 // We monkey-patch Math.random in the worker so every existing call site
@@ -59,7 +61,53 @@ const LYSIN_COUNT         = 1500;
 const PREDATOR_CELL_COUNT = 8;
 const DENSITY             = 200 / (200 * 200);
 
+// Noise + event log are owned by the worker and shared by reference with
+// the live grid. When the grid is rebuilt (mode change, save/load, reseed)
+// we re-attach these refs so the new grid uses the same config + log.
+const noise: NoiseConfig = { ...DEFAULT_NOISE };
+const eventLog = new EventLog(16); // 65536-event ring buffer
+// Auto-flush threshold: drain to main when the buffer is more than half
+// full. With CHUNK=5000 burn steps and modest noise rates, this fires
+// every few hundred ms — fast enough that the ring rarely overwrites.
+const EVENT_AUTOFLUSH_THRESHOLD = 0.5;
+function maybeAutoFlushEvents(): void {
+  if (eventLog.fillRatio() >= EVENT_AUTOFLUSH_THRESHOLD) flushEventLog();
+}
+function flushEventLog(): void {
+  if (eventLog.size() === 0) return;
+  const chunk = eventLog.drain();
+  const msg: EventLogChunkMsg = {
+    type: 'eventLogChunk',
+    n: chunk.n,
+    totalEverFired: chunk.totalEverFired,
+    droppedSinceLast: chunk.droppedSinceLast,
+    iters:  chunk.iters,
+    kinds:  chunk.kinds,
+    atomA:  chunk.atomA,
+    atomB:  chunk.atomB,
+    before: chunk.before,
+    after:  chunk.after,
+  };
+  self.postMessage(msg, [
+    chunk.iters.buffer  as Transferable,
+    chunk.kinds.buffer  as Transferable,
+    chunk.atomA.buffer  as Transferable,
+    chunk.atomB.buffer  as Transferable,
+    chunk.before.buffer as Transferable,
+    chunk.after.buffer  as Transferable,
+  ]);
+}
+
+// Hydrolysis config — owned by worker, attached to grid by reference like
+// noise. Default OFF so the base sim is bit-identical until toggled on.
+const hydrolysis: HydrolysisConfig = { ...DEFAULT_HYDROLYSIS };
+
 let grid = new Grid();
+function attachNoiseToGrid(): void {
+  grid.noise = noise;
+  grid.eventLog = eventLog;
+  grid.hydrolysis = hydrolysis;
+}
 let mode: Mode = 'rigged';
 let gridW = 0;
 let gridH = 0;
@@ -95,9 +143,10 @@ let gameStatus = 0;        // 0 playing, 1 won, 2 lost
 let noEnemyStartIter = -1; // -1 = enemies present; otherwise iteration when they vanished
 let lastLoopCounts = { player: 0, enemy: 0 };
 
-// Buffer pool — three quadruplets so we never starve while one is rendered and
+// Buffer pool — three quintuplets so we never starve while one is rendered and
 // one is in transit. Main returns each used set via a 'reuse' message.
 const atomsPool:    Float32Array[] = [allocAtomsBuffer(),    allocAtomsBuffer(),    allocAtomsBuffer()];
+const atomIdsPool:  Uint32Array[]  = [allocAtomIdsBuffer(),  allocAtomIdsBuffer(),  allocAtomIdsBuffer()];
 const loopsPool:    Uint32Array[]  = [allocLoopsBuffer(),    allocLoopsBuffer(),    allocLoopsBuffer()];
 const bondsPool:    Uint32Array[]  = [allocBondsBuffer(),    allocBondsBuffer(),    allocBondsBuffer()];
 const dropletsPool: Float32Array[] = [allocDropletsBuffer(), allocDropletsBuffer(), allocDropletsBuffer()];
@@ -119,11 +168,13 @@ function spawnLysinSpot(): void {
 // Used in game mode only.
 function spawnRandomWaterDrop(): void {
   if (grid.droplets.length >= MAX_DROPLETS) return;
-  grid.droplets.push({
-    x: gridW * (0.12 + Math.random() * 0.76),
-    y: gridH * (0.12 + Math.random() * 0.76),
-    r: 280 + Math.random() * 240,
-  });
+  const x = gridW * (0.12 + Math.random() * 0.76);
+  const y = gridH * (0.12 + Math.random() * 0.76);
+  const r = 280 + Math.random() * 240;
+  grid.droplets.push({ x, y, r });
+  // If hydrolysis is enabled, populate the new droplet with water atoms.
+  // No-op when disabled, so base sim is unaffected.
+  if (hydrolysis.enabled) generateWaterForDroplet(grid, x, y, r, hydrolysis.waterDensity);
   mergeDroplets();
 }
 
@@ -150,6 +201,7 @@ function spawnRandomSoupPatches(): void {
 function setupGame(): void {
   selectedCell = null;
   grid = new Grid();
+  attachNoiseToGrid();
   grid.create(gridW, gridH);
   grid.getChemistry().clear();
   grid.energyEnabled = false;
@@ -178,11 +230,11 @@ function setupGame(): void {
   // that happen to overlap into single bigger pools.
   const W_DROPS = 5;
   for (let k = 0; k < W_DROPS; k++) {
-    grid.droplets.push({
-      x: gridW * (0.15 + Math.random() * 0.7),
-      y: gridH * (0.15 + Math.random() * 0.7),
-      r: 320 + Math.random() * 200,
-    });
+    const x = gridW * (0.15 + Math.random() * 0.7);
+    const y = gridH * (0.15 + Math.random() * 0.7);
+    const r = 320 + Math.random() * 200;
+    grid.droplets.push({ x, y, r });
+    if (hydrolysis.enabled) generateWaterForDroplet(grid, x, y, r, hydrolysis.waterDensity);
   }
 
   // Soup patches — small clusters distributed across the arena, not laggy.
@@ -207,6 +259,7 @@ function setupGame(): void {
 function setupRigged(): void {
   selectedCell = null;
   grid = new Grid();
+  attachNoiseToGrid();
   grid.create(gridW, gridH);
   grid.getChemistry().clear();
   grid.energyEnabled = false;
@@ -226,6 +279,7 @@ function setupRigged(): void {
 function setupWild(): void {
   selectedCell = null;
   grid = new Grid();
+  attachNoiseToGrid();
   grid.create(gridW, gridH);
   initWild(grid, WILD_ATOM_COUNT);
 }
@@ -373,7 +427,7 @@ function packDroplets(buf: Float32Array): void {
   }
 }
 
-function packSnapshot(atomsBuf: Float32Array, loopsBuf: Uint32Array, bondsBuf: Uint32Array, dropletsBuf: Float32Array): { atomCount: number } {
+function packSnapshot(atomsBuf: Float32Array, atomIdsBuf: Uint32Array, loopsBuf: Uint32Array, bondsBuf: Uint32Array, dropletsBuf: Float32Array): { atomCount: number } {
   const cells = grid.getCells();
   const n = Math.min(cells.length, MAX_ATOMS);
   const indexMap = new Map<Cell, number>();
@@ -394,7 +448,10 @@ function packSnapshot(atomsBuf: Float32Array, loopsBuf: Uint32Array, bondsBuf: U
     if (c.playerControlled) flags |= 8;
     if (c === selectedCell) flags |= 16; // bit 4 = selected, drives the halo on the main thread
     atomsBuf[o + 3] = flags;
+    atomIdsBuf[i] = c.id >>> 0;
   }
+  // Zero unused tail so main can't see stale IDs from a prior snapshot.
+  if (n < atomIdsBuf.length) atomIdsBuf.fill(0, n);
 
   const loopRes = findMembraneLoopsAndPack(cells, indexMap, loopsBuf);
   lastLoopCounts.player = loopRes.playerLoops;
@@ -431,13 +488,14 @@ function packSnapshot(atomsBuf: Float32Array, loopsBuf: Uint32Array, bondsBuf: U
 }
 
 function postSnapshot(): void {
-  if (atomsPool.length === 0 || loopsPool.length === 0 || bondsPool.length === 0 || dropletsPool.length === 0) return;
+  if (atomsPool.length === 0 || atomIdsPool.length === 0 || loopsPool.length === 0 || bondsPool.length === 0 || dropletsPool.length === 0) return;
   const atoms    = atomsPool.shift()!;
+  const atomIds  = atomIdsPool.shift()!;
   const loops    = loopsPool.shift()!;
   const bonds    = bondsPool.shift()!;
   const droplets = dropletsPool.shift()!;
 
-  const { atomCount } = packSnapshot(atoms, loops, bonds, droplets);
+  const { atomCount } = packSnapshot(atoms, atomIds, loops, bonds, droplets);
 
   const winCountdown = (inGame && noEnemyStartIter >= 0)
     ? Math.max(0, WIN_NO_ENEMY_TICKS - (grid.iterations - noEnemyStartIter))
@@ -448,6 +506,7 @@ function postSnapshot(): void {
     atomCount,
     epoch: grid.epoch,
     atoms,
+    atomIds,
     loops,
     bonds,
     droplets,
@@ -458,10 +517,15 @@ function postSnapshot(): void {
   };
   self.postMessage(msg, [
     atoms.buffer as Transferable,
+    atomIds.buffer as Transferable,
     loops.buffer as Transferable,
     bonds.buffer as Transferable,
     droplets.buffer as Transferable,
   ]);
+  // Piggyback an event-log auto-flush onto each snapshot so main never
+  // has to poll. Cheap when nothing is buffered, prevents ring overwrite
+  // when noise rates are high.
+  maybeAutoFlushEvents();
 }
 
 // ── Save / Load ────────────────────────────────────────────────────────────
@@ -480,11 +544,13 @@ function buildSaveState(): SaveState {
   const cellState:  number[] = [];
   const cellEnergy: number[] = [];
   const cellPlayer: number[] = [];
+  const cellId:     number[] = [];
   for (const c of cells) {
     cellX.push(c.loc.x);  cellY.push(c.loc.y);
     cellVx.push(c.vel.x); cellVy.push(c.vel.y);
     cellType.push(c.type); cellState.push(c.state);
     cellEnergy.push(c.energy); cellPlayer.push(c.playerControlled ? 1 : 0);
+    cellId.push(c.id);
   }
 
   const bondList: number[] = [];
@@ -513,7 +579,16 @@ function buildSaveState(): SaveState {
     bondedDamping: grid.bondedDamping,
     dripFeed,
     dripSoupInterval, dripWaterInterval,
+    noiseEnabled:      noise.enabled,
+    noiseCopyFidelity: noise.copyFidelity,
+    noiseDecayRate:    noise.decayRate,
+    noiseBondFailRate: noise.bondFailRate,
+    hydrolysisEnabled:      hydrolysis.enabled,
+    hydrolysisBaseRate:     hydrolysis.baseRate,
+    hydrolysisWaterDensity: hydrolysis.waterDensity,
+    nextAtomId: grid.nextAtomId,
     cellX, cellY, cellVx, cellVy, cellType, cellState, cellEnergy, cellPlayer,
+    cellId,
     bonds: bondList,
     dropX, dropY, dropR,
   };
@@ -531,21 +606,34 @@ function loadSaveState(s: SaveState): string | null {
   gridW = s.gridW;
   gridH = s.gridH;
   grid = new Grid();
+  attachNoiseToGrid();
   grid.create(gridW, gridH);
+  // ID counter is finalized AFTER cell creation. Cells are restored with
+  // their original IDs via createCellWithId so the noise event log stays
+  // queryable across save/load.
   grid.getChemistry().clear();
   grid.energyEnabled = false;
   grid.getChemistry().mutationRate = 0;
   initSimple(grid, [], 0); // re-register chemistry rules without seeding any cells
 
   const newCells: Cell[] = [];
+  let maxId = 0;
   for (let i = 0; i < s.cellX.length; i++) {
-    const cell = grid.createCell(s.cellX[i], s.cellY[i], s.cellType[i], s.cellState[i]);
+    // Use the saved ID if present (v2+ saves), else assign a fresh one.
+    const id = s.cellId && typeof s.cellId[i] === 'number' ? s.cellId[i] : i + 1;
+    if (id > maxId) maxId = id;
+    const cell = grid.createCellWithId(s.cellX[i], s.cellY[i], s.cellType[i], s.cellState[i], id);
     cell.vel.x = s.cellVx[i];
     cell.vel.y = s.cellVy[i];
     cell.energy = s.cellEnergy[i];
     cell.playerControlled = !!s.cellPlayer[i];
     newCells.push(cell);
   }
+  // Bump nextAtomId past the highest restored ID (or use the saved counter
+  // if it's higher — e.g. a save taken after deletions). Either way, no
+  // future creation can collide with a restored ID.
+  const nextId = Math.max(maxId + 1, typeof s.nextAtomId === 'number' ? s.nextAtomId : 0);
+  grid.setNextAtomId(nextId);
   for (let b = 0; b < s.bonds.length; b += 2) {
     const i = s.bonds[b], j = s.bonds[b + 1];
     if (i >= 0 && i < newCells.length && j >= 0 && j < newCells.length) {
@@ -563,6 +651,18 @@ function loadSaveState(s: SaveState): string | null {
   dripFeed         = s.dripFeed;
   dripSoupInterval = s.dripSoupInterval;
   dripWaterInterval = s.dripWaterInterval;
+  // Noise — restore exact config so subsequent ticks replay the same
+  // mutation sequence under the same seed.
+  if (typeof s.noiseEnabled === 'boolean')      noise.enabled      = s.noiseEnabled;
+  if (typeof s.noiseCopyFidelity === 'number')  noise.copyFidelity = s.noiseCopyFidelity;
+  if (typeof s.noiseDecayRate === 'number')     noise.decayRate    = s.noiseDecayRate;
+  if (typeof s.noiseBondFailRate === 'number')  noise.bondFailRate = s.noiseBondFailRate;
+  if (typeof s.hydrolysisEnabled === 'boolean')      hydrolysis.enabled      = s.hydrolysisEnabled;
+  if (typeof s.hydrolysisBaseRate === 'number')      hydrolysis.baseRate     = s.hydrolysisBaseRate;
+  if (typeof s.hydrolysisWaterDensity === 'number')  hydrolysis.waterDensity = s.hydrolysisWaterDensity;
+  // Drain any pre-load events so the chunk doesn't conflate IDs from the
+  // pre-load and post-load grids in main's accumulator.
+  if (eventLog.size() > 0) flushEventLog();
   // RNG — restore exact stream position so future steps match the saver's
   _seed     = s.seed;
   _rngState = s.rngState;
@@ -775,11 +875,17 @@ self.onmessage = (e: MessageEvent<unknown>) => {
     case 'paintWater':
       if (grid.droplets.length < MAX_DROPLETS) {
         grid.droplets.push({ x: msg.x, y: msg.y, r: msg.radius });
+        // Populate the new droplet with water atoms when hydrolysis is on.
+        if (hydrolysis.enabled) {
+          generateWaterForDroplet(grid, msg.x, msg.y, msg.radius, hydrolysis.waterDensity);
+        }
         mergeDroplets();
       }
       return;
     case 'clearWater':
       grid.droplets.length = 0;
+      // Also drop any water atoms — they have no droplet to belong to now.
+      removeAllWater(grid);
       return;
     case 'startGame':
       inGame = true;
@@ -838,8 +944,34 @@ self.onmessage = (e: MessageEvent<unknown>) => {
         selectedCell = null;
       }
       return;
+    case 'setNoise':
+      noise.enabled      = msg.enabled;
+      noise.copyFidelity = Math.max(0, Math.min(1, msg.copyFidelity));
+      noise.decayRate    = Math.max(0, Math.min(1, msg.decayRate));
+      noise.bondFailRate = Math.max(0, Math.min(1, msg.bondFailRate));
+      return;
+    case 'setHydrolysis': {
+      const wasEnabled = hydrolysis.enabled;
+      hydrolysis.enabled      = msg.enabled;
+      hydrolysis.baseRate     = Math.max(0, msg.baseRate);
+      hydrolysis.waterDensity = Math.max(0, Math.min(1, msg.waterDensity));
+      // Toggling ON: populate existing droplets with water so the user
+      // immediately sees decomposition without having to add new water.
+      // Toggling OFF: remove all water atoms so reproducibility is
+      // restored bit-identically with pre-hydrolysis behavior.
+      if (!wasEnabled && hydrolysis.enabled) {
+        generateWaterForAllDroplets(grid, hydrolysis.waterDensity);
+      } else if (wasEnabled && !hydrolysis.enabled) {
+        removeAllWater(grid);
+      }
+      return;
+    }
+    case 'requestEventLog':
+      flushEventLog();
+      return;
     case 'reuse':
       atomsPool.push(msg.atoms);
+      atomIdsPool.push(msg.atomIds);
       loopsPool.push(msg.loops);
       bondsPool.push(msg.bonds);
       dropletsPool.push(msg.droplets);
