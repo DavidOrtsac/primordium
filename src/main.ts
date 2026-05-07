@@ -1193,6 +1193,27 @@ try {
   if (localStorage.getItem(PANEL_STATE_KEY) === '1') openPanel();
 } catch { /* private mode — leave closed */ }
 
+// First-visit discoverability pulse: if the user has never opened the
+// panel before (no localStorage entry exists), add a one-time breathing
+// glow to the ☰ Controls button so they know it's there. The pulse
+// auto-stops after a few cycles (CSS animation iteration count) and is
+// also cleared the moment the user opens the panel for the first time.
+try {
+  const seenBefore = localStorage.getItem(PANEL_STATE_KEY) !== null;
+  if (!seenBefore && menuToggleBtn) {
+    menuToggleBtn.classList.add('menu-pulse');
+    // Remove the pulse class once the animation finishes so it doesn't
+    // re-trigger on subsequent class changes.
+    const stopPulse = () => menuToggleBtn.classList.remove('menu-pulse');
+    menuToggleBtn.addEventListener('animationend', stopPulse, { once: true });
+    // Belt-and-suspenders: also clear after a fixed timeout in case the
+    // animationend event doesn't fire (some old WebKit edge cases).
+    setTimeout(stopPulse, 8000);
+  }
+} catch { /* private mode — pulse always shown, harmless */
+  if (menuToggleBtn) menuToggleBtn.classList.add('menu-pulse');
+}
+
 // Wire interactions
 if (menuToggleBtn) menuToggleBtn.addEventListener('click', togglePanel);
 if (panelCloseBtn) panelCloseBtn.addEventListener('click', closePanel);

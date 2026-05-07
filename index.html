@@ -161,11 +161,16 @@
         saturate(0.35)
         brightness(0.98);
     }
-    /* Frame wrapper: positioning + ambient glow ring */
+    /* Frame wrapper: positioning + ambient glow ring. The control panel
+       and backdrop now live INSIDE this frame as absolutely-positioned
+       children, so they overlay only the simulation window — never the
+       page chrome around it. overflow: hidden clips the slide-in
+       animation cleanly. */
     .scope-frame {
       position: relative;
       display: inline-block;
       line-height: 0;
+      overflow: hidden;
       box-shadow:
         0 0 0 1px var(--border-subtle),
         0 20px 60px -20px rgba(212, 166, 79, 0.10),
@@ -221,6 +226,52 @@
     .canvas-tool-btn.active {
       background: rgba(212, 166, 79, 0.16);
       border-color: rgba(212, 166, 79, 0.55);
+      color: var(--c-primary);
+    }
+    /* Menu button — wider when closed (shows "☰ Controls" label) so first-
+       time users immediately see there ARE controls. Compacts to icon-only
+       when the panel is open since the panel itself displays "CONTROLS"
+       in its header. */
+    .canvas-tool-btn--menu {
+      width: auto;
+      padding: 0 12px 0 10px;
+      gap: 7px;
+      font-family: var(--font-sans);
+      font-size: 0.78rem;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+    }
+    .canvas-tool-btn--menu .menu-icon { font-size: 1rem; line-height: 1; }
+    .canvas-tool-btn--menu .menu-label {
+      display: inline-block;
+      max-width: 70px;
+      overflow: hidden;
+      transition: max-width 0.22s var(--ease), opacity 0.18s var(--ease), margin-left 0.22s var(--ease);
+    }
+    /* When panel is open, the button collapses to icon-only */
+    .canvas-tool-btn--menu.active {
+      padding: 0;
+      width: 36px;
+    }
+    .canvas-tool-btn--menu.active .menu-label {
+      max-width: 0;
+      opacity: 0;
+      margin-left: -7px;
+    }
+    /* One-time discoverability pulse on the menu button. Class
+       'menu-pulse' is added by JS on first paint and removed after the
+       animation finishes (or on the user's first interaction with any
+       control). Subtle gold breathing glow that draws the eye without
+       being annoying. */
+    @keyframes menu-discover-pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(212, 166, 79, 0.0); }
+      40%  { box-shadow: 0 0 0 4px rgba(212, 166, 79, 0.30); }
+      80%  { box-shadow: 0 0 0 10px rgba(212, 166, 79, 0.0); }
+      100% { box-shadow: 0 0 0 0 rgba(212, 166, 79, 0.0); }
+    }
+    .canvas-tool-btn--menu.menu-pulse {
+      animation: menu-discover-pulse 2.4s var(--ease) 0s 3;
+      border-color: rgba(212, 166, 79, 0.45);
       color: var(--c-primary);
     }
     /* Backwards-compat — anywhere old .fs-toggle CSS is referenced */
@@ -608,12 +659,12 @@
        (X button, M key, Esc, or backdrop click on mobile). */
 
     .control-panel {
-      position: fixed;
+      position: absolute;
       top: 0;
       right: 0;
       bottom: 0;
       width: 380px;
-      max-width: 92vw;
+      max-width: 92%;   /* clip to scope-frame width */
       background: rgba(10, 10, 12, 0.82);
       backdrop-filter: blur(22px) saturate(1.15);
       -webkit-backdrop-filter: blur(22px) saturate(1.15);
@@ -628,6 +679,7 @@
       overflow-x: hidden;
       display: flex;
       flex-direction: column;
+      line-height: 1.5; /* reset scope-frame's line-height: 0 */
       -webkit-overflow-scrolling: touch;
     }
     .control-panel.open {
@@ -701,7 +753,7 @@
        dismiss). On desktop the panel is narrow enough that no backdrop
        is needed; canvas remains visible to its left. */
     .control-panel-backdrop {
-      position: fixed;
+      position: absolute;  /* relative to scope-frame */
       inset: 0;
       background: rgba(0, 0, 0, 0.42);
       opacity: 0;
@@ -950,28 +1002,26 @@
     <canvas id="canvas"></canvas>
     <canvas id="overlay"></canvas>
     <div class="canvas-tools">
-      <button id="menu-toggle" class="canvas-tool-btn" aria-label="Toggle controls panel" title="Controls (M)">☰</button>
+      <button id="menu-toggle" class="canvas-tool-btn canvas-tool-btn--menu" aria-label="Toggle controls panel" title="Controls (M)">
+        <span class="menu-icon">☰</span>
+        <span class="menu-label">Controls</span>
+      </button>
       <button id="fs-toggle" class="canvas-tool-btn" aria-label="Toggle fullscreen" title="Fullscreen">⛶</button>
     </div>
     <div id="game-overlay">
       <div id="game-overlay-title"></div>
       <div id="game-overlay-sub"></div>
     </div>
-  </div>
 
-  <div id="status">booting…</div>
+    <!-- Panel backdrop — only visible on mobile when panel is open.
+         Inside scope-frame so it dims only the canvas area, not the
+         whole page. -->
+    <div id="panel-backdrop" class="control-panel-backdrop" aria-hidden="true"></div>
 
-  <!-- Mobile-fallback toggle (kept for accessibility / no-JS cases). The
-       primary opener is now the floating ☰ in the canvas corner. -->
-  <button class="ctl-toggle" id="ctl-toggle" aria-label="Toggle controls">☰ Controls</button>
-
-  <!-- Panel backdrop — only visible on mobile when panel is open -->
-  <div id="panel-backdrop" class="control-panel-backdrop" aria-hidden="true"></div>
-
-  <!-- THE control panel. Slides in from the right; overlays the canvas
-       (canvas stays put, panel sits on top of right ~30%). All controls
-       live inside; the page outside is canvas + chrome only. -->
-  <aside id="control-panel" class="control-panel" aria-hidden="true">
+    <!-- THE control panel. Lives INSIDE the canvas frame so it overlays
+         only the simulation window, not the entire viewport. Slides in
+         from the right edge of the canvas. -->
+    <aside id="control-panel" class="control-panel" aria-hidden="true">
     <div class="control-panel-header">
       <span class="control-panel-title">Controls</span>
       <button id="panel-close" class="panel-close" aria-label="Close controls panel" title="Close (M / Esc)">✕</button>
@@ -1152,7 +1202,13 @@
     <div class="hint-row" hidden></div>
       </div>
     </div>
-  </aside>
+    </aside>
+  </div><!-- /#scope-frame -->
+
+  <div id="status">booting…</div>
+
+  <!-- Mobile-fallback toggle (kept for accessibility / no-JS cases). -->
+  <button class="ctl-toggle" id="ctl-toggle" aria-label="Toggle controls">☰ Controls</button>
 
   <script>
     // Cache-bust bundle.js with a per-page-load timestamp so iOS Safari
