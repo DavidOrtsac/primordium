@@ -483,6 +483,18 @@
     #hydro-btn.active        { background: rgba(77,  217, 232, 0.13); border-color: rgba(77,  217, 232, 0.55); color: var(--c-hydrolysis); box-shadow: 0 0 0 1px rgba(77,  217, 232, 0.25), 0 0 16px -6px rgba(77,  217, 232, 0.45); }
     #view-btn.active         { background: rgba(212, 166, 79,  0.13); border-color: rgba(212, 166, 79,  0.55); color: var(--c-primary); }
 
+    /* Reset — destructive, ember-red so the user notices before clicking */
+    button.danger {
+      background: rgba(255, 87, 87, 0.10);
+      border-color: rgba(255, 87, 87, 0.45);
+      color: #ff8a8a;
+    }
+    button.danger:hover {
+      background: rgba(255, 87, 87, 0.18);
+      border-color: rgba(255, 87, 87, 0.75);
+      color: #ffb0b0;
+    }
+
     /* Recording (REC) button — urgent red, blinking */
     #rec-btn { min-width: 72px; }
     button.recording {
@@ -1147,6 +1159,9 @@
       <div class="card__row">
         <button id="save-btn">💾 Save</button>
         <button id="load-btn">📂 Load</button>
+      </div>
+      <div class="card__row">
+        <button id="reset-btn" class="danger">♻️ Reset simulation</button>
       </div>
       <div class="card__row">
         <span class="ctl-label">📊 stats</span>
