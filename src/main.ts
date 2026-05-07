@@ -253,7 +253,12 @@ canvas.addEventListener('touchcancel', () => {
 }, { passive: true });
 
 // ── Worker ──────────────────────────────────────────────────────────────────
-const worker = new Worker('dist/worker.js');
+// Cache-bust the worker URL on every page load so iOS Safari and other
+// aggressive caches can't pin old physics code in memory. Bundle.js is
+// busted separately by the inline loader in index.html. Cost is one
+// extra worker.js fetch per session — irrelevant for a sim that runs
+// for minutes/hours.
+const worker = new Worker('dist/worker.js?v=' + Date.now());
 function send(msg: ControlMsg): void { worker.postMessage(msg); }
 function sendTransfer(msg: ControlMsg, transferables: Transferable[]): void {
   worker.postMessage(msg, transferables);
