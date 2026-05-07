@@ -941,6 +941,17 @@
     </div>
   </div>
 
-  <script src="dist/bundle.js"></script>
+  <script>
+    // Cache-bust bundle.js with a per-page-load timestamp so iOS Safari
+    // and other aggressive browser caches can't serve stale JS after a
+    // deploy. Cost: one re-download of a ~95KB file per session. Trivial
+    // for an interactive sim. Worker.js is busted separately inside
+    // bundle.js using the same technique.
+    (function() {
+      var s = document.createElement('script');
+      s.src = 'dist/bundle.js?v=' + Date.now();
+      document.body.appendChild(s);
+    })();
+  </script>
 </body>
 </html>
