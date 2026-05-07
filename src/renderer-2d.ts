@@ -677,21 +677,30 @@ export function draw2DClassic(
 // Draws the physical boundary of the simulation arena as a thin stroked
 // rectangle in WORLD coordinates. Caller is responsible for setting the
 // camera transform on `ctx` before calling — same convention as the rest
-// of the world-space renderers. Boundary uses a faint warm tone tuned so
-// it doesn't compete with atoms or membranes; line width scales inversely
-// with zoom so it's a constant visual thickness on screen at any zoom.
+// of the world-space renderers.
+//
+// Two-stroke "newspaper" effect: a faint light halo underneath, then a
+// crisp black line on top. This makes the border read consistently on
+// every view: on the dark educational/microscope canvas the halo provides
+// just enough contrast for the black line to be visible; on the white
+// classic surface the halo blends into the background and only the black
+// line registers. One style across all three views, no variant switch.
+//
+// Line width scales as 1/zoom so the stroke stays visually constant at
+// any zoom level (no "hairline disappears at far zoom" or "thick bar at
+// close zoom" failure modes).
 export function drawArenaBorder(
   ctx: CanvasRenderingContext2D, gridW: number, gridH: number, zoom: number,
-  variant: 'default' | 'classic' = 'default',
 ): void {
   const lineWidth = Math.max(0.6, 1.0 / zoom);
   ctx.save();
+  // Subtle light halo for contrast on dark backgrounds.
+  ctx.lineWidth = lineWidth * 2.4;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
+  ctx.strokeRect(0, 0, gridW, gridH);
+  // Crisp black line on top.
   ctx.lineWidth = lineWidth;
-  ctx.strokeStyle = variant === 'classic'
-    ? 'rgba(60, 60, 60, 0.55)'           // dark thin line on classic white
-    : 'rgba(212, 166, 79, 0.42)';        // warm gold, matches brand accent
-  ctx.shadowColor = variant === 'classic' ? 'transparent' : 'rgba(212, 166, 79, 0.18)';
-  ctx.shadowBlur = variant === 'classic' ? 0 : 6 / zoom;
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.92)';
   ctx.strokeRect(0, 0, gridW, gridH);
   ctx.restore();
 }
