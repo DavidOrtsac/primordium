@@ -97,18 +97,54 @@ function applyBrushAt(clientX: number, clientY: number): void {
     send({ type: 'paintSoup', x: w.x, y: w.y, radius: SOUP_BRUSH_RADIUS, count: SOUP_BRUSH_RATE });
   } else if (brushMode === 'water') {
     send({ type: 'paintWater', x: w.x, y: w.y, radius: WATER_BRUSH_RADIUS });
-  } else if (brushMode === 'select') {
-    // Pick the closest atom within 30 world units of the click. Worker pins
-    // a stable Cell reference; subsequent snapshots flag that atom so the
-    // halo follows it as it moves.
-    send({ type: 'selectAt', x: w.x, y: w.y, radius: 30 });
   }
+  // Note: select mode is handled via the dedicated drag-rectangle path
+  // below. A no-drag click (mouseup at the same spot as mousedown) fires
+  // a single-atom selectAt; otherwise the drag becomes a selectBox.
+}
+
+// Selection drag-rectangle state. Anchor + cursor in WORLD coordinates so
+// the box stays glued to the world while the camera moves underneath.
+// Both null when not dragging in select mode.
+let selectBoxStart: { x: number; y: number } | null = null;
+let selectBoxEnd:   { x: number; y: number } | null = null;
+// Screen-space anchor used to distinguish a no-drag click from a drag.
+// Recorded at mousedown; if mouseup happens within SELECT_CLICK_THRESHOLD
+// pixels of this point, treat it as a single-atom click.
+let selectAnchorScreen: { x: number; y: number } | null = null;
+const SELECT_CLICK_THRESHOLD = 6;
+function finishSelect(clientX: number, clientY: number): void {
+  if (!selectBoxStart || !selectAnchorScreen) {
+    selectBoxStart = null; selectBoxEnd = null; selectAnchorScreen = null;
+    return;
+  }
+  const dx = clientX - selectAnchorScreen.x;
+  const dy = clientY - selectAnchorScreen.y;
+  const movedFar = dx * dx + dy * dy > SELECT_CLICK_THRESHOLD * SELECT_CLICK_THRESHOLD;
+  if (movedFar && selectBoxEnd) {
+    send({
+      type: 'selectBox',
+      x0: selectBoxStart.x, y0: selectBoxStart.y,
+      x1: selectBoxEnd.x,   y1: selectBoxEnd.y,
+    });
+  } else {
+    // Treat as a click on the anchor point — single-atom select.
+    send({ type: 'selectAt', x: selectBoxStart.x, y: selectBoxStart.y, radius: 30 });
+  }
+  selectBoxStart = null;
+  selectBoxEnd = null;
+  selectAnchorScreen = null;
 }
 
 canvas.addEventListener('mousedown', (e) => {
   dragging = true; lastMx = e.clientX; lastMy = e.clientY;
   if (brushMode === 'pan') {
     canvas.style.cursor = 'grabbing';
+  } else if (brushMode === 'select') {
+    const w = screenToWorld(e.clientX, e.clientY);
+    selectBoxStart = { x: w.x, y: w.y };
+    selectBoxEnd   = { x: w.x, y: w.y };
+    selectAnchorScreen = { x: e.clientX, y: e.clientY };
   } else {
     applyBrushAt(e.clientX, e.clientY);
   }
@@ -120,6 +156,11 @@ window.addEventListener('mousemove', (e) => {
     camera.x -= d.dx;
     camera.y -= d.dy;
     lastMx = e.clientX; lastMy = e.clientY;
+  } else if (brushMode === 'select') {
+    if (selectBoxStart) {
+      const w = screenToWorld(e.clientX, e.clientY);
+      selectBoxEnd = { x: w.x, y: w.y };
+    }
   } else {
     // For continuous brushing, fire on each move event. Water gets one droplet
     // per move (sparse — surface tension makes overlapping ones still distinct);
@@ -131,7 +172,8 @@ window.addEventListener('mousemove', (e) => {
     }
   }
 });
-window.addEventListener('mouseup', () => {
+window.addEventListener('mouseup', (e) => {
+  if (dragging && brushMode === 'select') finishSelect(e.clientX, e.clientY);
   dragging = false;
   canvas.style.cursor = brushMode === 'pan' ? 'grab' : 'crosshair';
 });
@@ -176,7 +218,12 @@ canvas.addEventListener('touchstart', (e: TouchEvent) => {
     dragging = true;
     lastMx = t.clientX;
     lastMy = t.clientY;
-    if (brushMode !== 'pan') {
+    if (brushMode === 'select') {
+      const w = screenToWorld(t.clientX, t.clientY);
+      selectBoxStart = { x: w.x, y: w.y };
+      selectBoxEnd   = { x: w.x, y: w.y };
+      selectAnchorScreen = { x: t.clientX, y: t.clientY };
+    } else if (brushMode !== 'pan') {
       applyBrushAt(t.clientX, t.clientY);
     }
   } else if (e.touches.length === 2) {
@@ -226,6 +273,11 @@ canvas.addEventListener('touchmove', (e: TouchEvent) => {
       camera.x -= d.dx;
       camera.y -= d.dy;
       lastMx = t.clientX; lastMy = t.clientY;
+    } else if (brushMode === 'select') {
+      if (selectBoxStart) {
+        const w = screenToWorld(t.clientX, t.clientY);
+        selectBoxEnd = { x: w.x, y: w.y };
+      }
     } else {
       const dx = t.clientX - lastMx, dy = t.clientY - lastMy;
       if (dx * dx + dy * dy >= 6 * 6) {
@@ -239,6 +291,12 @@ canvas.addEventListener('touchmove', (e: TouchEvent) => {
 
 canvas.addEventListener('touchend', (e: TouchEvent) => {
   if (e.touches.length === 0) {
+    if (brushMode === 'select' && selectBoxStart) {
+      // changedTouches has the finger that just lifted — use it as the
+      // release point for the click-vs-drag decision.
+      const t = e.changedTouches[0];
+      if (t) finishSelect(t.clientX, t.clientY);
+    }
     activeGesture = 'none';
     dragging = false;
   } else if (e.touches.length === 1 && activeGesture === 'pinch') {
@@ -488,7 +546,7 @@ function setBrush(next: Brush): void {
     if (brushMode === 'pan')    logStatus('Brush off — drag pans the camera');
     if (brushMode === 'soup')   logStatus('Soup brush ON — click & drag to seed atoms');
     if (brushMode === 'water')  logStatus('Water brush ON — click to drop water (touching droplets fuse)');
-    if (brushMode === 'select') logStatus('Select ON — click an atom to highlight it · Delete/Backspace removes it');
+    if (brushMode === 'select') logStatus('Select ON — drag a box to grab atoms inside · click a single atom for individual select · Delete removes selection');
   }
 }
 function clearWater(): void {
@@ -749,15 +807,24 @@ const snapshotRing: { state: SaveState; label: string; capturedAt: number }[] = 
 function onSaveState(msg: SaveStateMsg): void {
   const job = _saveReasons.shift() ?? { reason: 'download' as SaveReason };
   if (job.reason === 'download') {
+    const tag  = `iter${msg.state.iterations}-seed${msg.state.seed}`;
+    const suggested = `primordium-${tag}`;
+    const raw = window.prompt('Name your save file (no extension):', suggested);
+    if (raw === null) {
+      logStatus('Save cancelled');
+      return;
+    }
+    // Sanitize: strip path separators and any trailing .json the user typed.
+    let name = raw.trim().replace(/[\\/]/g, '_').replace(/\.json$/i, '');
+    if (!name) name = suggested;
     const blob = new Blob([JSON.stringify(msg.state)], { type: 'application/json' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
-    const tag  = `iter${msg.state.iterations}-seed${msg.state.seed}`;
     a.href = url;
-    a.download = `primordium-${tag}-${Date.now()}.json`;
+    a.download = `${name}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
-    logStatus(`Saved · iter ${msg.state.iterations.toLocaleString()} · ${msg.state.cellX.length.toLocaleString()} atoms · ${msg.state.bonds.length / 2} bonds · ${msg.state.dropX.length} droplets`);
+    logStatus(`Saved "${name}.json" · iter ${msg.state.iterations.toLocaleString()} · ${msg.state.cellX.length.toLocaleString()} atoms · ${msg.state.bonds.length / 2} bonds`);
     return;
   }
   if (job.reason === 'quicksave') {
@@ -967,14 +1034,19 @@ function downloadSelection(): void {
     logStatus('No selection to download yet — click Open inspector first');
     return;
   }
+  const suggested = `primordium-selection-${lastSelection.atomCount}atoms`;
+  const raw = window.prompt('Name your selection file (no extension):', suggested);
+  if (raw === null) { logStatus('Selection save cancelled'); return; }
+  let name = raw.trim().replace(/[\\/]/g, '_').replace(/\.json$/i, '');
+  if (!name) name = suggested;
   const blob = new Blob([JSON.stringify(lastSelection)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `primordium-selection-${lastSelection.atomCount}atoms-${Date.now()}.json`;
+  a.download = `${name}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
-  logStatus(`Saved selection · ${lastSelection.atomCount} atoms · ${lastSelection.bonds.length / 2} bonds`);
+  logStatus(`Saved "${name}.json" · ${lastSelection.atomCount} atoms · ${lastSelection.bonds.length / 2} bonds`);
 }
 
 function pastePendingSelection(): void {
@@ -1649,6 +1721,8 @@ function loop(): void {
     // currently visible (overlay for GPU/Classic, main for 2D), so the
     // highlighted atom is always visible regardless of view mode.
     drawSelectionHalo(snap);
+    // In-progress selection rectangle (drawn while the user is dragging).
+    drawSelectionBox();
   }
   // also keep stepsPerFrame in sync (so worker has it after init)
   void stepsPerFrame;
@@ -1661,6 +1735,27 @@ function loop(): void {
 //   • GPU view      → overlay (sits over the GPU canvas)
 //   • 2D view       → main ctx2d (since the overlay is empty/cleared)
 //   • Microscope    → overlay (and we force-unhide it below)
+function drawSelectionBox(): void {
+  if (!selectBoxStart || !selectBoxEnd) return;
+  const useOverlay = viewMode !== 'educational' || useGPU;
+  const ctx = useOverlay ? overlayCtx : ctx2d;
+  if (!ctx) return;
+  const z = camera.zoom;
+  ctx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+  const x0 = Math.min(selectBoxStart.x, selectBoxEnd.x);
+  const y0 = Math.min(selectBoxStart.y, selectBoxEnd.y);
+  const w  = Math.abs(selectBoxEnd.x - selectBoxStart.x);
+  const h  = Math.abs(selectBoxEnd.y - selectBoxStart.y);
+  ctx.fillStyle = 'rgba(255, 220, 60, 0.10)';
+  ctx.fillRect(x0, y0, w, h);
+  ctx.lineWidth = Math.max(0.6, 1.2 / z);
+  ctx.strokeStyle = 'rgba(255, 220, 60, 0.85)';
+  ctx.setLineDash([4 / z, 3 / z]);
+  ctx.strokeRect(x0, y0, w, h);
+  ctx.setLineDash([]);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
 function drawSelectionHalo(snap: SnapshotMsg): void {
   // Selection is now a multi-atom set (cluster select via bond BFS in
   // the worker). Collect every atom carrying flag bit 4 and ring each

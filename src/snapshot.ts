@@ -60,6 +60,7 @@ export type ControlMsg =
   | { type: 'requestSave' }
   | { type: 'loadSave'; state: SaveState }
   | { type: 'selectAt'; x: number; y: number; radius: number }
+  | { type: 'selectBox'; x0: number; y0: number; x1: number; y1: number }
   | { type: 'deselectAll' }
   | { type: 'deleteSelected' }
   | { type: 'exportSelection' }
