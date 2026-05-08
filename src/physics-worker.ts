@@ -1049,6 +1049,22 @@ self.onmessage = (e: MessageEvent<unknown>) => {
       postSnapshotIfPaused();
       return;
     }
+    case 'replaceAtomType': {
+      // Sweep replace — every cell of fromType becomes toType. State, bonds,
+      // position, and ID are preserved; only the type label flips. Useful
+      // for "what if every lysin atom were just plain b?" experiments.
+      // Validated against the alphabet so junk input can't smuggle weird
+      // type labels into the chemistry matcher.
+      const allowed = 'abcdefwp';
+      if (!msg.fromType || !msg.toType) return;
+      if (allowed.indexOf(msg.fromType) === -1 || allowed.indexOf(msg.toType) === -1) return;
+      if (msg.fromType === msg.toType) return;
+      for (const c of grid.getCells()) {
+        if (c.type === msg.fromType) c.type = msg.toType;
+      }
+      postSnapshotIfPaused();
+      return;
+    }
     case 'pasteSelection': {
       // Re-instantiate atoms from a previously exported selection at the
       // requested anchor point. The exported coords get re-centered on

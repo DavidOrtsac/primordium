@@ -1256,6 +1256,62 @@ if (editToggleBtn) editToggleBtn.addEventListener('click', () => setEditMode(!ed
 toolBtns.forEach(b => b.addEventListener('click', () => setEditTool(b.dataset.tool as EditTool)));
 paletteBtns.forEach(b => b.addEventListener('click', () => setPaletteAtom(b.dataset.atom ?? 'a')));
 if (atomStateInput) atomStateInput.addEventListener('input', refreshEditorStatus);
+
+// ── Inspector: bulk type replacement ──────────────────────────────────────
+// Sweep the entire sim, swap every atom of the From type into the To type.
+// State, bonds, position, ID all preserved — only the type label changes.
+// Built into the Inspector modal because it's a study-tool operation
+// (e.g., "what happens if every lysin atom were a 'b' instead?").
+const ATOM_LABELS: Record<string, string> = {
+  a: 'a — membrane / peptidoglycan',
+  b: 'b — common gene base',
+  c: 'c — rare gene base',
+  d: 'd — polymerase enzyme',
+  e: 'e — gene start (oriC)',
+  f: 'f — gene end (ter)',
+  w: 'w — water',
+  p: 'p — lysin',
+};
+const replaceFromSel = document.getElementById('replace-from') as HTMLSelectElement | null;
+const replaceToSel   = document.getElementById('replace-to')   as HTMLSelectElement | null;
+const replaceApplyBtn = document.getElementById('replace-apply') as HTMLButtonElement | null;
+const replaceStatusEl = document.getElementById('replace-status') as HTMLSpanElement | null;
+function populateReplaceSelects(): void {
+  if (!replaceFromSel || !replaceToSel) return;
+  for (const sel of [replaceFromSel, replaceToSel]) {
+    sel.innerHTML = '';
+    for (const [t, label] of Object.entries(ATOM_LABELS)) {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = label;
+      sel.appendChild(opt);
+    }
+  }
+  replaceFromSel.value = 'p';
+  replaceToSel.value = 'b';
+}
+populateReplaceSelects();
+if (replaceApplyBtn) {
+  replaceApplyBtn.addEventListener('click', () => {
+    if (!replaceFromSel || !replaceToSel) return;
+    const from = replaceFromSel.value;
+    const to = replaceToSel.value;
+    if (from === to) {
+      if (replaceStatusEl) replaceStatusEl.textContent = 'From and To are the same — no change.';
+      return;
+    }
+    const ok = window.confirm(
+      `Replace EVERY "${from}" atom in the entire sim with "${to}"?\n\n` +
+      `This sweeps the whole arena, not just your selection. State, bonds, and IDs are preserved.`,
+    );
+    if (!ok) return;
+    send({ type: 'replaceAtomType', fromType: from, toType: to });
+    if (replaceStatusEl) replaceStatusEl.textContent = `Replaced all "${from}" → "${to}".`;
+    logStatus(`Bulk replace: every "${from}" → "${to}" (sim-wide)`);
+    // Refresh the inspector view in case the selection contains affected atoms.
+    if (isInspectorOpen()) refreshSelectionFromWorker();
+  });
+}
 // Freeze — the panic button. Pause the sim, zero all noise sliders (without
 // losing their slider positions), and quicksave. One key for "I see something
 // interesting, capture it now and stop the world from changing."
