@@ -1358,6 +1358,69 @@ function pushCustomChemistry(): void {
   refreshCustomSummary();
   refreshCustomLists();
   refreshRuleTypeSelectors();
+  rebuildInspectorPalette();
+  rebuildReplaceTypeSelects();
+}
+
+// Rebuild the Inspector edit-mode palette so user-defined atoms show up
+// alongside the 8 built-ins. Each palette button gets the atom's color
+// and label, and clicking it sets editAtomType. The state input snaps
+// to the atom's defaultState (built-ins use the static DEFAULT_STATE
+// table; customs use whatever the user picked in the Lab).
+function rebuildInspectorPalette(): void {
+  const palette = document.querySelector<HTMLDivElement>('.editor-palette');
+  if (!palette) return;
+  // Wipe and rebuild — simpler than diffing for a small palette size.
+  palette.innerHTML = '';
+  const builtins: Array<{ t: string; color: string }> = [
+    { t: 'a', color: '#8a6d3b' }, { t: 'b', color: '#7fb069' },
+    { t: 'c', color: '#dca54c' }, { t: 'd', color: '#d96d6d' },
+    { t: 'e', color: '#c97df7' }, { t: 'f', color: '#5db8d8' },
+    { t: 'w', color: '#66ccff' }, { t: 'p', color: '#ff8844' },
+  ];
+  const all: Array<{ t: string; color: string; defaultState: number }> = [
+    ...builtins.map(b => ({ ...b, defaultState: DEFAULT_STATE[b.t] ?? 0 })),
+    ...customAtoms.map(a => ({ t: a.type, color: a.color, defaultState: a.defaultState })),
+  ];
+  for (const a of all) {
+    const btn = document.createElement('button');
+    btn.className = 'palette-btn';
+    btn.dataset.atom = a.t;
+    btn.textContent = a.t;
+    btn.style.setProperty('--atom-color', a.color);
+    if (a.t === editAtomType) btn.classList.add('active');
+    btn.addEventListener('click', () => {
+      editAtomType = a.t;
+      DEFAULT_STATE[a.t] = a.defaultState;
+      // Update the .active class across the live palette.
+      palette.querySelectorAll('.palette-btn').forEach(b => b.classList.toggle('active', (b as HTMLElement).dataset.atom === a.t));
+      if (atomStateInput) atomStateInput.value = String(a.defaultState);
+      refreshEditorStatus();
+    });
+    palette.appendChild(btn);
+  }
+}
+
+// The bulk replace-type selects also need the latest custom atoms so the
+// user can swap any atom into any other (built-in ↔ custom).
+function rebuildReplaceTypeSelects(): void {
+  if (!replaceFromSel || !replaceToSel) return;
+  // Add custom-atom options if not already present.
+  for (const sel of [replaceFromSel, replaceToSel]) {
+    const prev = sel.value;
+    sel.innerHTML = '';
+    for (const [t, label] of Object.entries(ATOM_LABELS)) {
+      const opt = document.createElement('option');
+      opt.value = t; opt.textContent = label;
+      sel.appendChild(opt);
+    }
+    for (const a of customAtoms) {
+      const opt = document.createElement('option');
+      opt.value = a.type; opt.textContent = `${a.type} — ${a.name}`;
+      sel.appendChild(opt);
+    }
+    if (prev) sel.value = prev;
+  }
 }
 function hexToRgb01(hex: string): [number, number, number] {
   const m = hex.replace('#', '');

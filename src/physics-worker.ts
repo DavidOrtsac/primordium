@@ -1068,11 +1068,13 @@ self.onmessage = (e: MessageEvent<unknown>) => {
     case 'editAddAtom': {
       // Inspector edit: spawn a new atom at world coords and add it to
       // the live selection so the user sees their additions both in the
-      // inspector preview and in the running sim. Type is validated
-      // against the chemistry alphabet — anything unrecognized is a
-      // no-op (keeps malformed messages from corrupting the grid).
-      const allowed = 'abcdefwp';
-      if (!msg.atomType || allowed.indexOf(msg.atomType) === -1) return;
+      // inspector preview and in the running sim. Type must be either
+      // built-in (a-f, w, p) OR a currently-registered custom atom.
+      // Anything else is a no-op so malformed messages can't corrupt
+      // the grid with phantom types.
+      const isBuiltin = msg.atomType && 'abcdefwp'.indexOf(msg.atomType) !== -1;
+      const isCustom  = customAtoms.some(a => a.type === msg.atomType);
+      if (!isBuiltin && !isCustom) return;
       const x = Math.max(0, Math.min(gridW, msg.x));
       const y = Math.max(0, Math.min(gridH, msg.y));
       const state = Math.max(0, Math.min(50, msg.state | 0));
