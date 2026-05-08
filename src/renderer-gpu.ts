@@ -891,7 +891,18 @@ export function drawGPU(
   device.queue.submit([cmd.finish()]);
 }
 
+// Custom-atom color overrides — populated by main thread when the user
+// adds atoms via the Lab. Keys are single-character type symbols, values
+// are normalized [r,g,b] in 0..1 range (matching the built-in palette).
+const _customColors = new Map<string, [number, number, number]>();
+export function setCustomAtomColor(type: string, rgb: [number, number, number]): void {
+  _customColors.set(type, rgb);
+}
+export function clearCustomAtomColors(): void { _customColors.clear(); }
+
 function colorFor(type: string): [number, number, number] {
+  const custom = _customColors.get(type);
+  if (custom) return custom;
   switch (type) {
     case 'e': return [1.0, 0.2, 0.2];
     case 'f': return [0.2, 1.0, 0.2];

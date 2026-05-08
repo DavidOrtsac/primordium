@@ -14,7 +14,9 @@
 //
 // No physics state lives here.
 
-import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, SelectionExportMsg, SelectionState, SaveState, STRIDE } from './snapshot';
+import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, SelectionExportMsg, SelectionState, CustomAtomDef, CustomRuleSpec, SaveState, STRIDE } from './snapshot';
+import { setCustomAtomColor as setGPUCustomColor } from './renderer-gpu';
+import { setClassicAtomColor, setEducationalAtomColor } from './renderer-2d';
 import { draw2D, draw2DClassic, drawHUD2D, drawArenaBorder } from './renderer-2d';
 import { initGPU, drawGPU } from './renderer-gpu';
 
@@ -1312,6 +1314,375 @@ if (replaceApplyBtn) {
     if (isInspectorOpen()) refreshSelectionFromWorker();
   });
 }
+
+// ── Lab: custom atoms + custom rules ──────────────────────────────────────
+// User-defined chemistry layer. Atoms are visual + symbolic; rules drive
+// behavior. Built-ins are never modified — custom rules append on top of
+// the seeded chemistry, so a bad rule list can't ever break the demo sim.
+// Persisted to localStorage so a closed tab returns to the same chemistry.
+const CUSTOM_ATOMS_KEY = 'primordium-custom-atoms-v1';
+const CUSTOM_RULES_KEY = 'primordium-custom-rules-v1';
+const RESERVED_LABELS  = new Set(['a','b','c','d','e','f','w','p','x','y','z']);
+
+let customAtoms: CustomAtomDef[] = [];
+let customRules: CustomRuleSpec[] = [];
+
+function loadCustomFromStorage(): void {
+  try {
+    const a = localStorage.getItem(CUSTOM_ATOMS_KEY);
+    const r = localStorage.getItem(CUSTOM_RULES_KEY);
+    if (a) customAtoms = JSON.parse(a);
+    if (r) customRules = JSON.parse(r);
+  } catch { /* corrupt — start fresh */ customAtoms = []; customRules = []; }
+}
+function saveCustomToStorage(): void {
+  try {
+    localStorage.setItem(CUSTOM_ATOMS_KEY, JSON.stringify(customAtoms));
+    localStorage.setItem(CUSTOM_RULES_KEY, JSON.stringify(customRules));
+  } catch { /* private mode etc — soft-fail */ }
+}
+loadCustomFromStorage();
+
+function pushCustomChemistry(): void {
+  send({ type: 'setCustomAtoms', atoms: customAtoms });
+  send({ type: 'setCustomRules', rules: customRules });
+  // Apply colors to every renderer path so custom atoms look the same in
+  // educational, classic, and microscope views.
+  for (const a of customAtoms) {
+    const rgb = hexToRgb01(a.color);
+    setGPUCustomColor(a.type, rgb);
+    setClassicAtomColor(a.type, a.color);
+    setEducationalAtomColor(a.type, a.color);
+  }
+  saveCustomToStorage();
+  refreshCustomSummary();
+  refreshCustomLists();
+  refreshRuleTypeSelectors();
+}
+function hexToRgb01(hex: string): [number, number, number] {
+  const m = hex.replace('#', '');
+  const n = parseInt(m.length === 3 ? m.split('').map(c => c + c).join('') : m, 16);
+  return [((n >> 16) & 0xff) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255];
+}
+function refreshCustomSummary(): void {
+  const el = document.getElementById('custom-summary');
+  if (el) el.textContent = `${customAtoms.length} custom atom${customAtoms.length === 1 ? '' : 's'} · ${customRules.length} custom rule${customRules.length === 1 ? '' : 's'}`;
+}
+
+// ── Custom atom CRUD UI ───────────────────────────────────────────────────
+const caSymbolEl = document.getElementById('ca-symbol') as HTMLInputElement | null;
+const caNameEl   = document.getElementById('ca-name')   as HTMLInputElement | null;
+const caColorEl  = document.getElementById('ca-color')  as HTMLInputElement | null;
+const caStateEl  = document.getElementById('ca-state')  as HTMLInputElement | null;
+const caAddBtn   = document.getElementById('ca-add')    as HTMLButtonElement | null;
+const caRandomBtn = document.getElementById('ca-random') as HTMLButtonElement | null;
+const customAtomListEl = document.getElementById('custom-atom-list') as HTMLDivElement | null;
+
+function refreshCustomAtomList(): void {
+  if (!customAtomListEl) return;
+  customAtomListEl.innerHTML = '';
+  if (customAtoms.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'lab-section-hint';
+    empty.textContent = 'No custom atoms yet.';
+    customAtomListEl.appendChild(empty);
+    return;
+  }
+  for (const a of customAtoms) {
+    const row = document.createElement('div');
+    row.className = 'lab-list-item';
+    const swatch = document.createElement('div');
+    swatch.className = 'lab-list-swatch';
+    swatch.style.background = a.color;
+    const text = document.createElement('div');
+    text.className = 'lab-list-text';
+    text.textContent = `${a.type} — ${a.name} · default state ${a.defaultState}`;
+    const del = document.createElement('button');
+    del.textContent = '✕';
+    del.title = 'Delete this custom atom';
+    del.addEventListener('click', () => {
+      customAtoms = customAtoms.filter(x => x.type !== a.type);
+      // Drop any rules that referenced the deleted atom — silently, so
+      // nothing in the worker ends up referencing a phantom type.
+      customRules = customRules.filter(r =>
+        r.aType !== a.type && r.bType !== a.type && r.cType !== a.type,
+      );
+      pushCustomChemistry();
+    });
+    row.append(swatch, text, del);
+    customAtomListEl.appendChild(row);
+  }
+}
+
+function nextAvailableSymbol(): string {
+  const used = new Set([...RESERVED_LABELS, ...customAtoms.map(a => a.type)]);
+  for (const ch of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') {
+    if (!used.has(ch)) return ch;
+  }
+  return '';
+}
+function randomAtomName(): string {
+  const prefixes = ['Glob', 'Pyr', 'Quor', 'Mure', 'Nex', 'Hel', 'Zeph', 'Lum', 'Vor', 'Astr', 'Cryo', 'Phlog'];
+  const suffixes = ['ium', 'ase', 'one', 'ide', 'ane', 'in', 'on', 'ate', 'yl', 'ene'];
+  return prefixes[Math.floor(Math.random() * prefixes.length)] + suffixes[Math.floor(Math.random() * suffixes.length)];
+}
+function randomNiceColor(): string {
+  // Avoid super-dark colors that vanish against the dark canvas. Generate
+  // HSL with high saturation and mid lightness, then convert to hex.
+  const h = Math.floor(Math.random() * 360);
+  const s = 0.6 + Math.random() * 0.3;
+  const l = 0.55 + Math.random() * 0.15;
+  return hslToHex(h, s, l);
+}
+function hslToHex(h: number, s: number, l: number): string {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if      (h < 60)  { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else              { r = c; b = x; }
+  const toHex = (v: number) => Math.round((v + m) * 255).toString(16).padStart(2, '0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+if (caRandomBtn) caRandomBtn.addEventListener('click', () => {
+  if (!caSymbolEl || !caNameEl || !caColorEl || !caStateEl) return;
+  caSymbolEl.value = nextAvailableSymbol();
+  caNameEl.value   = randomAtomName();
+  caColorEl.value  = randomNiceColor();
+  caStateEl.value  = String(Math.floor(Math.random() * 6));
+});
+if (caAddBtn) caAddBtn.addEventListener('click', () => {
+  if (!caSymbolEl || !caNameEl || !caColorEl || !caStateEl) return;
+  const sym = caSymbolEl.value.toUpperCase().trim();
+  if (!sym || sym.length !== 1 || !/[A-Z0-9]/.test(sym)) {
+    logStatus('Custom atom symbol must be a single uppercase letter or digit.');
+    return;
+  }
+  if (RESERVED_LABELS.has(sym.toLowerCase())) {
+    logStatus(`"${sym}" is reserved by the built-in chemistry. Pick another.`);
+    return;
+  }
+  if (customAtoms.some(a => a.type === sym)) {
+    logStatus(`Atom "${sym}" already exists. Delete it first to redefine.`);
+    return;
+  }
+  customAtoms.push({
+    type: sym,
+    name: caNameEl.value.trim() || sym,
+    color: caColorEl.value || '#cccccc',
+    defaultState: Math.max(0, Math.min(50, parseInt(caStateEl.value, 10) || 0)),
+  });
+  caSymbolEl.value = '';
+  caNameEl.value = '';
+  pushCustomChemistry();
+  logStatus(`Added custom atom "${sym}".`);
+});
+
+// ── Custom rule CRUD UI ───────────────────────────────────────────────────
+const crNameEl    = document.getElementById('cr-name')    as HTMLInputElement | null;
+const crInputsEl  = document.getElementById('cr-inputs')  as HTMLSelectElement | null;
+const crCasesEl   = document.getElementById('cr-cases')   as HTMLInputElement | null;
+const crATypeEl   = document.getElementById('cr-a-type')  as HTMLSelectElement | null;
+const crAStateEl  = document.getElementById('cr-a-state') as HTMLInputElement | null;
+const crABBondEl  = document.getElementById('cr-ab-bond') as HTMLInputElement | null;
+const crAFutureEl = document.getElementById('cr-a-future') as HTMLInputElement | null;
+const crABFutureEl= document.getElementById('cr-ab-future')as HTMLInputElement | null;
+const crBTypeEl   = document.getElementById('cr-b-type')  as HTMLSelectElement | null;
+const crBStateEl  = document.getElementById('cr-b-state') as HTMLInputElement | null;
+const crBFutureEl = document.getElementById('cr-b-future') as HTMLInputElement | null;
+const crCRow      = document.getElementById('cr-c-row')   as HTMLDivElement | null;
+const crCTypeEl   = document.getElementById('cr-c-type')  as HTMLSelectElement | null;
+const crCStateEl  = document.getElementById('cr-c-state') as HTMLInputElement | null;
+const crBCBondEl  = document.getElementById('cr-bc-bond') as HTMLInputElement | null;
+const crACBondEl  = document.getElementById('cr-ac-bond') as HTMLInputElement | null;
+const crCFutureEl = document.getElementById('cr-c-future') as HTMLInputElement | null;
+const crBCFutureEl= document.getElementById('cr-bc-future')as HTMLInputElement | null;
+const crACFutureEl= document.getElementById('cr-ac-future')as HTMLInputElement | null;
+const crAddBtn    = document.getElementById('cr-add')     as HTMLButtonElement | null;
+const crRandomBtn = document.getElementById('cr-random')  as HTMLButtonElement | null;
+const crClearBtn  = document.getElementById('cr-clear-all') as HTMLButtonElement | null;
+const customRuleListEl = document.getElementById('custom-rule-list') as HTMLDivElement | null;
+
+function refreshRuleTypeSelectors(): void {
+  // Populate the three reactant <select>s with built-ins + customs + wildcards.
+  const opts: { value: string; label: string }[] = [
+    { value: 'a', label: 'a (membrane)' },
+    { value: 'b', label: 'b (gene base)' },
+    { value: 'c', label: 'c (gene base)' },
+    { value: 'd', label: 'd (enzyme)' },
+    { value: 'e', label: 'e (gene start)' },
+    { value: 'f', label: 'f (gene end)' },
+    { value: 'w', label: 'w (water)' },
+    { value: 'p', label: 'p (lysin)' },
+    { value: 'x', label: 'x (wildcard)' },
+    { value: 'y', label: 'y (wildcard)' },
+    { value: 'z', label: 'z (wildcard)' },
+  ];
+  for (const a of customAtoms) opts.push({ value: a.type, label: `${a.type} (${a.name})` });
+  for (const sel of [crATypeEl, crBTypeEl, crCTypeEl]) {
+    if (!sel) continue;
+    const prev = sel.value;
+    sel.innerHTML = '';
+    for (const o of opts) {
+      const el = document.createElement('option');
+      el.value = o.value; el.textContent = o.label;
+      sel.appendChild(el);
+    }
+    if (prev && opts.some(o => o.value === prev)) sel.value = prev;
+  }
+}
+function refreshCRowVisibility(): void {
+  if (!crCRow || !crInputsEl) return;
+  crCRow.style.display = crInputsEl.value === '3' ? '' : 'none';
+}
+if (crInputsEl) crInputsEl.addEventListener('change', refreshCRowVisibility);
+refreshCRowVisibility();
+
+function refreshCustomRuleList(): void {
+  if (!customRuleListEl) return;
+  customRuleListEl.innerHTML = '';
+  if (customRules.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'lab-section-hint';
+    empty.textContent = 'No custom rules yet.';
+    customRuleListEl.appendChild(empty);
+    return;
+  }
+  for (const rule of customRules) {
+    const row = document.createElement('div');
+    row.className = 'lab-list-item';
+    const text = document.createElement('div');
+    text.className = 'lab-list-text';
+    const reactants = rule.nInputs === 3
+      ? `${rule.aType}(${rule.aState})${rule.currentAbBond ? '⎯' : '·'}${rule.bType}(${rule.bState}) + ${rule.cType}(${rule.cState ?? 0})`
+      : `${rule.aType}(${rule.aState})${rule.currentAbBond ? '⎯' : '·'}${rule.bType}(${rule.bState})`;
+    const products = rule.nInputs === 3
+      ? `${rule.aType}(${rule.futureAState})${rule.futureAbBond ? '⎯' : '·'}${rule.bType}(${rule.futureBState}) + ${rule.cType}(${rule.futureCState ?? 0})`
+      : `${rule.aType}(${rule.futureAState})${rule.futureAbBond ? '⎯' : '·'}${rule.bType}(${rule.futureBState})`;
+    text.textContent = `${rule.name || '(unnamed)'} · ${reactants} → ${products} · cases=${rule.cases}`;
+    const del = document.createElement('button');
+    del.textContent = '✕';
+    del.title = 'Delete rule';
+    del.addEventListener('click', () => {
+      customRules = customRules.filter(r => r.id !== rule.id);
+      pushCustomChemistry();
+    });
+    row.append(text, del);
+    customRuleListEl.appendChild(row);
+  }
+}
+
+function refreshCustomLists(): void {
+  refreshCustomAtomList();
+  refreshCustomRuleList();
+}
+
+function readRuleFormSpec(): CustomRuleSpec | null {
+  if (!crInputsEl || !crATypeEl || !crBTypeEl) return null;
+  const nInputs = (crInputsEl.value === '3' ? 3 : 2) as 2 | 3;
+  const cases = Math.max(1, parseInt(crCasesEl?.value ?? '1', 10) || 1);
+  const spec: CustomRuleSpec = {
+    id: 'r' + Date.now() + '-' + Math.floor(Math.random() * 1e6),
+    name: crNameEl?.value.trim() || 'rule',
+    nInputs,
+    aType: crATypeEl.value,
+    aState: parseInt(crAStateEl?.value ?? '0', 10) || 0,
+    currentAbBond: !!crABBondEl?.checked,
+    bType: crBTypeEl.value,
+    bState: parseInt(crBStateEl?.value ?? '0', 10) || 0,
+    futureAState: parseInt(crAFutureEl?.value ?? '0', 10) || 0,
+    futureAbBond: !!crABFutureEl?.checked,
+    futureBState: parseInt(crBFutureEl?.value ?? '0', 10) || 0,
+    cases,
+  };
+  if (nInputs === 3) {
+    spec.cType = crCTypeEl?.value ?? 'a';
+    spec.cState = parseInt(crCStateEl?.value ?? '0', 10) || 0;
+    spec.currentBcBond = !!crBCBondEl?.checked;
+    spec.currentAcBond = !!crACBondEl?.checked;
+    spec.futureCState  = parseInt(crCFutureEl?.value ?? '0', 10) || 0;
+    spec.futureBcBond  = !!crBCFutureEl?.checked;
+    spec.futureAcBond  = !!crACFutureEl?.checked;
+  }
+  return spec;
+}
+if (crAddBtn) crAddBtn.addEventListener('click', () => {
+  const spec = readRuleFormSpec();
+  if (!spec) return;
+  customRules.push(spec);
+  pushCustomChemistry();
+  logStatus(`Added custom rule "${spec.name}" (${customRules.length} total).`);
+});
+if (crRandomBtn) crRandomBtn.addEventListener('click', () => {
+  // Random fill — every field gets a sensible random value, then the user
+  // can review and Add.
+  if (!crNameEl || !crInputsEl || !crCasesEl) return;
+  crNameEl.value = randomAtomName().toLowerCase() + 'ation';
+  const allTypes = ['a','b','c','d','e','f','w','p', ...customAtoms.map(a => a.type)];
+  const randType = () => allTypes[Math.floor(Math.random() * allTypes.length)];
+  const randState = () => Math.floor(Math.random() * 51);
+  const randBool = () => Math.random() < 0.5;
+  const nInputs = Math.random() < 0.4 ? '3' : '2';
+  crInputsEl.value = nInputs;
+  refreshCRowVisibility();
+  crCasesEl.value = String(1 + Math.floor(Math.random() * 100));
+  if (crATypeEl) crATypeEl.value = randType();
+  if (crBTypeEl) crBTypeEl.value = randType();
+  if (crCTypeEl) crCTypeEl.value = randType();
+  if (crAStateEl)  crAStateEl.value  = String(randState());
+  if (crBStateEl)  crBStateEl.value  = String(randState());
+  if (crCStateEl)  crCStateEl.value  = String(randState());
+  if (crABBondEl)  crABBondEl.checked  = randBool();
+  if (crBCBondEl)  crBCBondEl.checked  = randBool();
+  if (crACBondEl)  crACBondEl.checked  = randBool();
+  if (crAFutureEl) crAFutureEl.value = String(randState());
+  if (crBFutureEl) crBFutureEl.value = String(randState());
+  if (crCFutureEl) crCFutureEl.value = String(randState());
+  if (crABFutureEl) crABFutureEl.checked = randBool();
+  if (crBCFutureEl) crBCFutureEl.checked = randBool();
+  if (crACFutureEl) crACFutureEl.checked = randBool();
+});
+if (crClearBtn) crClearBtn.addEventListener('click', () => {
+  if (customRules.length === 0) return;
+  if (!window.confirm(`Delete all ${customRules.length} custom rules?`)) return;
+  customRules = [];
+  pushCustomChemistry();
+  logStatus('Cleared all custom rules.');
+});
+
+// ── Lab modal open/close ──────────────────────────────────────────────────
+const labModal   = document.getElementById('lab-modal') as HTMLDivElement | null;
+const labOpenBtn = document.getElementById('lab-open-btn') as HTMLButtonElement | null;
+const labCloseBtn = document.getElementById('lab-close')   as HTMLButtonElement | null;
+function openLab(): void {
+  if (!labModal) return;
+  refreshCustomLists();
+  refreshRuleTypeSelectors();
+  refreshCRowVisibility();
+  labModal.classList.add('shown');
+  labModal.setAttribute('aria-hidden', 'false');
+}
+function closeLab(): void {
+  if (!labModal) return;
+  labModal.classList.remove('shown');
+  labModal.setAttribute('aria-hidden', 'true');
+}
+function isLabOpen(): boolean {
+  return !!labModal && labModal.classList.contains('shown');
+}
+if (labOpenBtn) labOpenBtn.addEventListener('click', openLab);
+if (labCloseBtn) labCloseBtn.addEventListener('click', closeLab);
+
+// Initial push so the worker has the persisted custom chemistry from disk.
+// Deferred via setTimeout so the worker has finished init() first; the
+// worker itself ignores the message until then anyway, but this avoids
+// queueing it before the worker exists.
+setTimeout(() => { pushCustomChemistry(); }, 100);
 // Freeze — the panic button. Pause the sim, zero all noise sliders (without
 // losing their slider positions), and quicksave. One key for "I see something
 // interesting, capture it now and stop the world from changing."
@@ -1875,13 +2246,14 @@ document.addEventListener('keydown', (e) => {
     pushPlayerInput();
     return;
   }
-  // Esc: cancel a pending bond → close inspector → close panel → reset brush.
+  // Esc: pending bond → lab → inspector → panel → reset brush.
   if (e.code === 'Escape') {
     if (isInspectorOpen() && bondPendingId !== null) {
       bondPendingId = null;
       setEditorStatus('Bond gesture cancelled.');
       return;
     }
+    if (isLabOpen()) { closeLab(); return; }
     if (isInspectorOpen()) { closeInspector(); return; }
     if (isPanelOpen()) { closePanel(); return; }
     setBrush('pan');

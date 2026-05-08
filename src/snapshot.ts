@@ -69,6 +69,8 @@ export type ControlMsg =
   | { type: 'editDeleteAtom'; atomId: number }
   | { type: 'editToggleBond'; atomIdA: number; atomIdB: number }
   | { type: 'replaceAtomType'; fromType: string; toType: string }
+  | { type: 'setCustomAtoms'; atoms: CustomAtomDef[] }
+  | { type: 'setCustomRules'; rules: CustomRuleSpec[] }
   | { type: 'setNoise'; enabled: boolean; copyFidelity: number; decayRate: number; bondFailRate: number }
   | { type: 'setHydrolysis'; enabled: boolean; baseRate: number; waterDensity: number }
   | { type: 'requestEventLog' }
@@ -128,6 +130,35 @@ export type SaveState = {
   dropX: number[];
   dropY: number[];
   dropR: number[];
+};
+
+// User-defined atom — purely a label + cosmetic record. Behavior comes
+// from custom rules that reference this type. Built-in alphabet
+// (a/b/c/d/e/f/w/p) and wildcards (x/y/z) are reserved and rejected.
+export type CustomAtomDef = {
+  type: string;          // single character symbol, e.g. 'A', 'Z', '0'
+  name: string;          // human-readable label
+  color: string;         // hex like '#aabbcc'
+  defaultState: number;  // shown in the palette state input when picked
+};
+
+// Wire-format spec for a user-defined reaction. Compiled into a Reaction
+// object on the worker via r2/r3. nInputs = 2 or 3. The shape mirrors
+// reaction.ts but lives in the protocol so JSON travels cleanly.
+export type CustomRuleSpec = {
+  id: string;            // stable client-side ID for diffing in the UI
+  name: string;          // human-readable label, shown in the editor list
+  nInputs: 2 | 3;
+  // Reactants
+  aType: string; aState: number; currentAbBond: boolean;
+  bType: string; bState: number;
+  cType?: string; cState?: number;
+  currentBcBond?: boolean; currentAcBond?: boolean;
+  // Products
+  futureAState: number; futureAbBond: boolean;
+  futureBState: number; futureBcBond?: boolean;
+  futureCState?: number; futureAcBond?: boolean;
+  cases: number;         // probability denominator (1 = always, 100 = ~1%)
 };
 
 // Selection export — a portable subgraph of atoms + their internal bonds.
