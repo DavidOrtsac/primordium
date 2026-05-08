@@ -935,10 +935,9 @@ self.onmessage = (e: MessageEvent<unknown>) => {
       burning = false;
       return;
     case 'selectAt': {
-      // Find the closest cell within radius, then BFS through its bond graph
-      // so the entire connected structure becomes the selection. A free atom
-      // (no bonds) selects only itself; a fully-formed cell selects every
-      // atom that's transitively bonded to the click point.
+      // Single-atom select: the closest cell within radius, no graph
+      // expansion. Use selectBox for cluster / region selection so the
+      // user controls exactly what's grabbed.
       const candidates = grid.getAllWithinRadius(msg.x, msg.y, msg.radius);
       let best: Cell | null = null;
       let bestD2 = Infinity;
@@ -949,15 +948,21 @@ self.onmessage = (e: MessageEvent<unknown>) => {
         if (d2 < bestD2) { bestD2 = d2; best = c; }
       }
       selectedSet.clear();
-      if (best) {
-        const queue: Cell[] = [best];
-        selectedSet.add(best);
-        while (queue.length > 0) {
-          const c = queue.shift()!;
-          for (const b of c.bonds) {
-            if (!selectedSet.has(b)) { selectedSet.add(b); queue.push(b); }
-          }
-        }
+      if (best) selectedSet.add(best);
+      postSnapshotIfPaused();
+      return;
+    }
+    case 'selectBox': {
+      // Region select: every atom whose center lies inside the world-space
+      // rectangle becomes part of the selection. Lets the user grab "what's
+      // inside this cell" or a custom group of free atoms without dragging
+      // in any bonded neighbors they didn't intend.
+      const x0 = Math.min(msg.x0, msg.x1), x1 = Math.max(msg.x0, msg.x1);
+      const y0 = Math.min(msg.y0, msg.y1), y1 = Math.max(msg.y0, msg.y1);
+      selectedSet.clear();
+      for (const c of grid.getCells()) {
+        const x = c.loc.x, y = c.loc.y;
+        if (x >= x0 && x <= x1 && y >= y0 && y <= y1) selectedSet.add(c);
       }
       postSnapshotIfPaused();
       return;
