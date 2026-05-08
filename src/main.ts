@@ -14,7 +14,7 @@
 //
 // No physics state lives here.
 
-import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, SaveState, STRIDE } from './snapshot';
+import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, SelectionExportMsg, SelectionState, SaveState, STRIDE } from './snapshot';
 import { draw2D, draw2DClassic, drawHUD2D, drawArenaBorder } from './renderer-2d';
 import { initGPU, drawGPU } from './renderer-gpu';
 
@@ -276,7 +276,7 @@ function sendTransfer(msg: ControlMsg, transferables: Transferable[]): void {
 // caused a deadlock when the worker only had 2 buffers in its pool).
 let lastSnapshot: SnapshotMsg | null = null;
 
-type WorkerMsg = SnapshotMsg | BurnProgressMsg | BurnDoneMsg | SaveStateMsg | LoadResultMsg | EventLogChunkMsg;
+type WorkerMsg = SnapshotMsg | BurnProgressMsg | BurnDoneMsg | SaveStateMsg | LoadResultMsg | EventLogChunkMsg | SelectionExportMsg;
 
 worker.onmessage = (e: MessageEvent<WorkerMsg>) => {
   const data = e.data;
@@ -296,6 +296,7 @@ worker.onmessage = (e: MessageEvent<WorkerMsg>) => {
   if (data.type === 'saveState')    { onSaveState(data);    return; }
   if (data.type === 'loadResult')   { onLoadResult(data);   return; }
   if (data.type === 'eventLogChunk'){ onEventLogChunk(data); return; }
+  if (data.type === 'selectionExport') { onSelectionExport(data); return; }
 };
 
 // ── State (UI-only) ─────────────────────────────────────────────────────────
@@ -811,6 +812,190 @@ function captureAutoSnapshot(label: string): void {
   _saveReasons.push({ reason: 'snapshot', label });
   send({ type: 'requestSave' });
 }
+
+// ── Selection inspector ───────────────────────────────────────────────────
+// The inspector overlays the sim with a frozen render of the user's current
+// selection (one connected bond-graph component). Sim keeps running below
+// — this modal does NOT pause physics, just shows a snapshot. Save the
+// selection as JSON to study mutations across runs; load JSON to paste a
+// previously captured structure back into the sim.
+const inspectorModal       = document.getElementById('inspector')           as HTMLDivElement | null;
+const inspectorCanvas      = document.getElementById('inspector-canvas')    as HTMLCanvasElement | null;
+const inspectorStats       = document.getElementById('inspector-stats')     as HTMLDivElement | null;
+const inspectorClose       = document.getElementById('inspector-close')     as HTMLButtonElement | null;
+const inspectorDownload    = document.getElementById('inspector-download')  as HTMLButtonElement | null;
+const inspectorLoad        = document.getElementById('inspector-load')      as HTMLButtonElement | null;
+const inspectBtn           = document.getElementById('inspect-btn')         as HTMLButtonElement | null;
+const pasteBtn             = document.getElementById('paste-btn')           as HTMLButtonElement | null;
+const selectionCountEl     = document.getElementById('selection-count')     as HTMLSpanElement | null;
+
+let lastSelection: SelectionState | null = null;
+let pendingPaste: SelectionState | null = null;
+
+// Hidden file input — single instance, reused for selection JSON loads.
+const selectionFileInput = document.createElement('input');
+selectionFileInput.type = 'file';
+selectionFileInput.accept = 'application/json,.json';
+selectionFileInput.style.display = 'none';
+document.body.appendChild(selectionFileInput);
+selectionFileInput.addEventListener('change', async () => {
+  const file = selectionFileInput.files?.[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const sel = JSON.parse(text) as SelectionState;
+    if (sel.magic !== 'primordium-selection' || !Array.isArray(sel.cellX)) {
+      logStatus(`Not a Primordium selection file (${file.name})`);
+      selectionFileInput.value = '';
+      return;
+    }
+    pendingPaste = sel;
+    lastSelection = sel;
+    renderInspector(sel);
+    if (inspectorModal && inspectorModal.classList.contains('shown')) {
+      logStatus(`Loaded "${file.name}" · ${sel.atomCount} atoms · close inspector then click Paste to drop into sim`);
+    } else {
+      logStatus(`Loaded "${file.name}" · ${sel.atomCount} atoms · click 📥 Paste to drop at view center`);
+    }
+  } catch (err: unknown) {
+    const m = err instanceof Error ? err.message : 'unknown';
+    logStatus(`Selection load failed: ${m}`);
+  }
+  selectionFileInput.value = '';
+});
+
+function openInspector(): void {
+  if (!inspectorModal) return;
+  // Ask the worker for a fresh export of the current selection. We render
+  // when the response arrives.
+  send({ type: 'exportSelection' });
+  inspectorModal.classList.add('shown');
+  inspectorModal.setAttribute('aria-hidden', 'false');
+}
+function closeInspector(): void {
+  if (!inspectorModal) return;
+  inspectorModal.classList.remove('shown');
+  inspectorModal.setAttribute('aria-hidden', 'true');
+}
+function isInspectorOpen(): boolean {
+  return !!inspectorModal && inspectorModal.classList.contains('shown');
+}
+
+function onSelectionExport(msg: SelectionExportMsg): void {
+  lastSelection = msg.selection;
+  renderInspector(msg.selection);
+}
+
+// Render selection into the inspector canvas + stats panel. Centroid →
+// canvas center, scaled to fit with margin. Bonds drawn first, then atoms
+// on top so coloring is dominant.
+const ATOM_COLORS: Record<string, string> = {
+  a: '#8a6d3b', b: '#7fb069', c: '#dca54c', d: '#d96d6d',
+  e: '#c97df7', f: '#5db8d8', w: '#66ccff', p: '#ff8844',
+};
+function renderInspector(sel: SelectionState): void {
+  if (!inspectorCanvas || !inspectorStats) return;
+  const ctx = inspectorCanvas.getContext('2d');
+  if (!ctx) return;
+  const W = inspectorCanvas.width, H = inspectorCanvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (sel.atomCount === 0) {
+    inspectorStats.textContent = 'Empty selection — pick something with the Select brush first.';
+    return;
+  }
+  // Compute bounding box for fit-to-canvas scaling.
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < sel.atomCount; i++) {
+    if (sel.cellX[i] < minX) minX = sel.cellX[i];
+    if (sel.cellY[i] < minY) minY = sel.cellY[i];
+    if (sel.cellX[i] > maxX) maxX = sel.cellX[i];
+    if (sel.cellY[i] > maxY) maxY = sel.cellY[i];
+  }
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const span = Math.max(20, Math.max(maxX - minX, maxY - minY));
+  const scale = (Math.min(W, H) - 32) / span;
+  const tx = (x: number) => (x - cx) * scale + W / 2;
+  const ty = (y: number) => (y - cy) * scale + H / 2;
+  const r = Math.max(2.5, 6 * scale);
+
+  // Bonds underlay.
+  ctx.lineWidth = Math.max(1, r * 0.45);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.32)';
+  for (let k = 0; k + 1 < sel.bonds.length; k += 2) {
+    const i = sel.bonds[k], j = sel.bonds[k + 1];
+    ctx.beginPath();
+    ctx.moveTo(tx(sel.cellX[i]), ty(sel.cellY[i]));
+    ctx.lineTo(tx(sel.cellX[j]), ty(sel.cellY[j]));
+    ctx.stroke();
+  }
+  // Atoms.
+  for (let i = 0; i < sel.atomCount; i++) {
+    const t = sel.cellType[i];
+    ctx.fillStyle = ATOM_COLORS[t] ?? '#cccccc';
+    ctx.beginPath();
+    ctx.arc(tx(sel.cellX[i]), ty(sel.cellY[i]), r, 0, Math.PI * 2);
+    ctx.fill();
+    // Tiny type label for high-zoom legibility.
+    if (r >= 5) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+      ctx.font = `${Math.max(8, r * 0.9)}px ui-monospace, monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(t, tx(sel.cellX[i]), ty(sel.cellY[i]));
+    }
+  }
+
+  // Stats: type histogram + bond count + a small JSON peek.
+  const hist: Record<string, number> = {};
+  for (const t of sel.cellType) hist[t] = (hist[t] ?? 0) + 1;
+  const histLine = Object.entries(hist)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([t, n]) => `${t}:${n}`)
+    .join('  ');
+  const lines = [
+    `Atoms:  ${sel.atomCount}`,
+    `Bonds:  ${sel.bonds.length / 2}`,
+    `Types:  ${histLine}`,
+    `Saved:  ${sel.savedAt}`,
+  ];
+  inspectorStats.textContent = lines.join('\n');
+}
+
+function downloadSelection(): void {
+  if (!lastSelection) {
+    logStatus('No selection to download yet — click Open inspector first');
+    return;
+  }
+  const blob = new Blob([JSON.stringify(lastSelection)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `primordium-selection-${lastSelection.atomCount}atoms-${Date.now()}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  logStatus(`Saved selection · ${lastSelection.atomCount} atoms · ${lastSelection.bonds.length / 2} bonds`);
+}
+
+function pastePendingSelection(): void {
+  if (!pendingPaste) {
+    selectionFileInput.click();
+    return;
+  }
+  // Drop atoms at the world point currently at the center of the visible
+  // canvas — predictable, no extra click needed.
+  const wx = camera.x + (canvas.width / 2) / camera.zoom;
+  const wy = camera.y + (canvas.height / 2) / camera.zoom;
+  send({ type: 'pasteSelection', x: wx, y: wy, selection: pendingPaste });
+  logStatus(`📥 Pasted ${pendingPaste.atomCount} atoms at view center · bonds preserved`);
+  pendingPaste = null;
+}
+
+if (inspectorClose) inspectorClose.addEventListener('click', closeInspector);
+if (inspectorDownload) inspectorDownload.addEventListener('click', downloadSelection);
+if (inspectorLoad) inspectorLoad.addEventListener('click', () => selectionFileInput.click());
+if (inspectBtn) inspectBtn.addEventListener('click', openInspector);
+if (pasteBtn) pasteBtn.addEventListener('click', pastePendingSelection);
 // Freeze — the panic button. Pause the sim, zero all noise sliders (without
 // losing their slider positions), and quicksave. One key for "I see something
 // interesting, capture it now and stop the world from changing."
@@ -1374,12 +1559,14 @@ document.addEventListener('keydown', (e) => {
     pushPlayerInput();
     return;
   }
-  // Esc: close the panel first if open, otherwise reset brush.
+  // Esc: close the inspector first, then panel, then reset brush.
   if (e.code === 'Escape') {
+    if (isInspectorOpen()) { closeInspector(); return; }
     if (isPanelOpen()) { closePanel(); return; }
     setBrush('pan');
     return;
   }
+  if (e.code === 'KeyI') { e.preventDefault(); openInspector(); }
   if (e.code === 'Space') { e.preventDefault(); togglePause(); }
   if (e.code === 'KeyP')  { toggleLysin(); }
   if (e.code === 'KeyR')  { toggleRecording(); }
@@ -1397,7 +1584,7 @@ document.addEventListener('keydown', (e) => {
   if ((e.code === 'Delete' || e.code === 'Backspace') && brushMode === 'select') {
     e.preventDefault();
     send({ type: 'deleteSelected' });
-    logStatus('Selected atom deleted — observe the cell\'s response');
+    logStatus('Selection deleted — observe the response (works while paused)');
   }
 });
 document.addEventListener('keyup', (e) => {
@@ -1475,20 +1662,25 @@ function loop(): void {
 //   • 2D view       → main ctx2d (since the overlay is empty/cleared)
 //   • Microscope    → overlay (and we force-unhide it below)
 function drawSelectionHalo(snap: SnapshotMsg): void {
-  // Find the selected atom in this snapshot. There's at most one.
-  let sx = -1, sy = -1;
+  // Selection is now a multi-atom set (cluster select via bond BFS in
+  // the worker). Collect every atom carrying flag bit 4 and ring each
+  // one. Also drives the panel's "N atoms selected" indicator.
+  const xs: number[] = [];
+  const ys: number[] = [];
   for (let i = 0; i < snap.atomCount; i++) {
     const flags = snap.atoms[i * STRIDE + 3] | 0;
     if (flags & 16) {
-      sx = snap.atoms[i * STRIDE + 0];
-      sy = snap.atoms[i * STRIDE + 1];
-      break;
+      xs.push(snap.atoms[i * STRIDE + 0]);
+      ys.push(snap.atoms[i * STRIDE + 1]);
     }
   }
-  // The overlay is now always visible (arena boundary lives there), so
-  // we no longer need to toggle the `hidden` class for selection purposes.
+  if (selectionCountEl) {
+    selectionCountEl.textContent = xs.length === 0
+      ? 'No selection · use the Select brush, then click any atom'
+      : `${xs.length} atom${xs.length === 1 ? '' : 's'} selected · press I or click Open inspector`;
+  }
   const microscope = viewMode === 'microscope';
-  if (sx < 0) return;
+  if (xs.length === 0) return;
 
   // Pick the right context. In the pure-2D view the overlay is empty and the
   // main ctx2d holds the world; everywhere else the overlay sits on top.
@@ -1501,21 +1693,28 @@ function drawSelectionHalo(snap: SnapshotMsg): void {
   ctx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
 
   // Pulsing yellow halo. Period ~1.2s. Phase from wallclock so it animates
-  // even if the sim is paused.
+  // even if the sim is paused. Drawn for every selected atom so a
+  // cluster reads as a glowing constellation rather than a single dot.
   const t = (performance.now() / 1000) * 2 * Math.PI / 1.2;
   const pulse = 0.6 + 0.4 * (Math.sin(t) * 0.5 + 0.5);
   ctx.lineWidth = Math.max(1.0, 2.5 / z);
   ctx.strokeStyle = `rgba(255, 220, 60, ${pulse.toFixed(3)})`;
-  ctx.beginPath();
-  ctx.arc(sx, sy, 14, 0, Math.PI * 2);
-  ctx.stroke();
-  // Inner crosshair so the user can see the exact center even at low zoom.
-  ctx.strokeStyle = `rgba(255, 240, 120, ${(pulse * 0.7).toFixed(3)})`;
-  ctx.lineWidth = Math.max(0.6, 1.0 / z);
-  ctx.beginPath();
-  ctx.moveTo(sx - 8, sy); ctx.lineTo(sx + 8, sy);
-  ctx.moveTo(sx, sy - 8); ctx.lineTo(sx, sy + 8);
-  ctx.stroke();
+  for (let i = 0; i < xs.length; i++) {
+    ctx.beginPath();
+    ctx.arc(xs[i], ys[i], 14, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  // Crosshair: only on a single-atom selection, otherwise the visual
+  // gets noisy with N crosshairs across a cluster.
+  if (xs.length === 1) {
+    const sx = xs[0], sy = ys[0];
+    ctx.strokeStyle = `rgba(255, 240, 120, ${(pulse * 0.7).toFixed(3)})`;
+    ctx.lineWidth = Math.max(0.6, 1.0 / z);
+    ctx.beginPath();
+    ctx.moveTo(sx - 8, sy); ctx.lineTo(sx + 8, sy);
+    ctx.moveTo(sx, sy - 8); ctx.lineTo(sx, sy + 8);
+    ctx.stroke();
+  }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
 }
 requestAnimationFrame(loop);

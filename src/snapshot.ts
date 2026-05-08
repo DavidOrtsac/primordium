@@ -62,6 +62,8 @@ export type ControlMsg =
   | { type: 'selectAt'; x: number; y: number; radius: number }
   | { type: 'deselectAll' }
   | { type: 'deleteSelected' }
+  | { type: 'exportSelection' }
+  | { type: 'pasteSelection'; x: number; y: number; selection: SelectionState }
   | { type: 'setNoise'; enabled: boolean; copyFidelity: number; decayRate: number; bondFailRate: number }
   | { type: 'setHydrolysis'; enabled: boolean; baseRate: number; waterDensity: number }
   | { type: 'requestEventLog' }
@@ -121,6 +123,27 @@ export type SaveState = {
   dropX: number[];
   dropY: number[];
   dropR: number[];
+};
+
+// Selection export — a portable subgraph of atoms + their internal bonds.
+// Lighter than SaveState (no RNG / sim params) since it represents a
+// study artifact that can be pasted into any running sim, not a full
+// world restore. Bond indices are local to the cell arrays.
+export type SelectionState = {
+  magic: 'primordium-selection';
+  version: 1;
+  savedAt: string;
+  atomCount: number;
+  cellX: number[];
+  cellY: number[];
+  cellType: string[];
+  cellState: number[];
+  bonds: number[]; // flat [i0,j0, i1,j1, ...] with i < j
+};
+
+export type SelectionExportMsg = {
+  type: 'selectionExport';
+  selection: SelectionState;
 };
 
 export type SaveStateMsg = {

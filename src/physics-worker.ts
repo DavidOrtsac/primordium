@@ -131,7 +131,12 @@ let burnTarget = 0;
 // selected atom so the main thread knows which one to highlight. Cleared
 // whenever the grid is rebuilt (init / setSeed / setupGame / loadSaveState)
 // since the Cell pointer would otherwise be stale.
-let selectedCell: Cell | null = null;
+// Multi-atom selection. A click runs a BFS through the bond graph from the
+// nearest atom, so the user grabs an entire bonded structure (a cell, a
+// half-formed dimer, a free atom) in one click. Stored as a Set of stable
+// Cell refs so post-tick spatial-hash shuffles don't desync. Flag bit 4 on
+// the snapshot is set for every atom in the set, drawing a halo per atom.
+let selectedSet: Set<Cell> = new Set();
 const SOUP_RESPAWN_INTERVAL   = 700;   // ticks between soup waves
 const SOUP_RESPAWN_PATCHES    = 5;
 const SOUP_RESPAWN_PER_PATCH  = 90;    // 5 × 90 = 450 atoms per wave
@@ -199,7 +204,7 @@ function spawnRandomSoupPatches(): void {
 }
 
 function setupGame(): void {
-  selectedCell = null;
+  selectedSet.clear();
   grid = new Grid();
   attachNoiseToGrid();
   grid.create(gridW, gridH);
@@ -257,7 +262,7 @@ function setupGame(): void {
 }
 
 function setupRigged(): void {
-  selectedCell = null;
+  selectedSet.clear();
   grid = new Grid();
   attachNoiseToGrid();
   grid.create(gridW, gridH);
@@ -277,7 +282,7 @@ function setupRigged(): void {
 }
 
 function setupWild(): void {
-  selectedCell = null;
+  selectedSet.clear();
   grid = new Grid();
   attachNoiseToGrid();
   grid.create(gridW, gridH);
@@ -446,7 +451,7 @@ function packSnapshot(atomsBuf: Float32Array, atomIdsBuf: Uint32Array, loopsBuf:
     if (c.type === 'a' && c.state >= Q) flags |= 2;
     if (c.type === 'a') flags |= 4;
     if (c.playerControlled) flags |= 8;
-    if (c === selectedCell) flags |= 16; // bit 4 = selected, drives the halo on the main thread
+    if (selectedSet.has(c)) flags |= 16; // bit 4 = selected, drives the halo on the main thread
     atomsBuf[o + 3] = flags;
     atomIdsBuf[i] = c.id >>> 0;
   }
@@ -485,6 +490,14 @@ function packSnapshot(atomsBuf: Float32Array, atomIdsBuf: Uint32Array, loopsBuf:
 
   packDroplets(dropletsBuf);
   return { atomCount: n };
+}
+
+// Force a snapshot push when the sim is paused. The tick loop skips
+// postSnapshot() while paused (no physics ran, no point), but selection
+// edits (select / deselect / delete / paste) still need to round-trip
+// to the renderer so the user sees their change immediately.
+function postSnapshotIfPaused(): void {
+  if (paused) postSnapshot();
 }
 
 function postSnapshot(): void {
@@ -673,7 +686,7 @@ function loadSaveState(s: SaveState): string | null {
   noEnemyStartIter = -1;
   burning = false;
   burnTarget = 0;
-  selectedCell = null;
+  selectedSet.clear();
   return null;
 }
 
@@ -922,7 +935,10 @@ self.onmessage = (e: MessageEvent<unknown>) => {
       burning = false;
       return;
     case 'selectAt': {
-      // Find the closest cell within radius. If none, clear selection.
+      // Find the closest cell within radius, then BFS through its bond graph
+      // so the entire connected structure becomes the selection. A free atom
+      // (no bonds) selects only itself; a fully-formed cell selects every
+      // atom that's transitively bonded to the click point.
       const candidates = grid.getAllWithinRadius(msg.x, msg.y, msg.radius);
       let best: Cell | null = null;
       let bestD2 = Infinity;
@@ -932,18 +948,84 @@ self.onmessage = (e: MessageEvent<unknown>) => {
         const d2 = dx * dx + dy * dy;
         if (d2 < bestD2) { bestD2 = d2; best = c; }
       }
-      selectedCell = best;
+      selectedSet.clear();
+      if (best) {
+        const queue: Cell[] = [best];
+        selectedSet.add(best);
+        while (queue.length > 0) {
+          const c = queue.shift()!;
+          for (const b of c.bonds) {
+            if (!selectedSet.has(b)) { selectedSet.add(b); queue.push(b); }
+          }
+        }
+      }
+      postSnapshotIfPaused();
       return;
     }
     case 'deselectAll':
-      selectedCell = null;
+      selectedSet.clear();
+      postSnapshotIfPaused();
       return;
     case 'deleteSelected':
-      if (selectedCell) {
-        grid.removeCell(selectedCell);
-        selectedCell = null;
+      if (selectedSet.size > 0) {
+        for (const c of selectedSet) grid.removeCell(c);
+        selectedSet.clear();
+        postSnapshotIfPaused();
       }
       return;
+    case 'exportSelection': {
+      // Serialize the selected subgraph as a portable JSON-ready record.
+      // Bond indices are local to the export array, so the payload is
+      // self-contained and can be pasted into any sim later.
+      const arr = Array.from(selectedSet);
+      const idToIdx = new Map<number, number>();
+      for (let i = 0; i < arr.length; i++) idToIdx.set(arr[i].id, i);
+      const localBonds: number[] = [];
+      for (let i = 0; i < arr.length; i++) {
+        for (const b of arr[i].bonds) {
+          const j = idToIdx.get(b.id);
+          if (j !== undefined && i < j) localBonds.push(i, j);
+        }
+      }
+      const selection = {
+        magic: 'primordium-selection' as const,
+        version: 1 as const,
+        savedAt: new Date().toISOString(),
+        atomCount: arr.length,
+        cellX:    arr.map(c => c.loc.x),
+        cellY:    arr.map(c => c.loc.y),
+        cellType: arr.map(c => c.type),
+        cellState: arr.map(c => c.state),
+        bonds: localBonds,
+      };
+      self.postMessage({ type: 'selectionExport', selection });
+      return;
+    }
+    case 'pasteSelection': {
+      // Re-instantiate atoms from a previously exported selection at the
+      // requested anchor point. The exported coords get re-centered on
+      // (msg.x, msg.y) so the paste lands wherever the user asked.
+      const s = msg.selection;
+      if (!s || s.cellX.length === 0) return;
+      let cx = 0, cy = 0;
+      for (let i = 0; i < s.cellX.length; i++) { cx += s.cellX[i]; cy += s.cellY[i]; }
+      cx /= s.cellX.length; cy /= s.cellY.length;
+      const dx = msg.x - cx, dy = msg.y - cy;
+      const created: Cell[] = [];
+      for (let i = 0; i < s.cellX.length; i++) {
+        const x = Math.max(0, Math.min(gridW, s.cellX[i] + dx));
+        const y = Math.max(0, Math.min(gridH, s.cellY[i] + dy));
+        const c = grid.createCell(x, y, s.cellType[i], s.cellState[i] | 0);
+        created.push(c);
+      }
+      for (let k = 0; k + 1 < s.bonds.length; k += 2) {
+        const a = created[s.bonds[k]];
+        const b = created[s.bonds[k + 1]];
+        if (a && b) a.bondTo(b);
+      }
+      postSnapshotIfPaused();
+      return;
+    }
     case 'setNoise':
       noise.enabled      = msg.enabled;
       noise.copyFidelity = Math.max(0, Math.min(1, msg.copyFidelity));
