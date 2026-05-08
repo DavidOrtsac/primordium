@@ -856,6 +856,70 @@
       gap: 8px;
       flex-wrap: wrap;
     }
+    .inspector-editor {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 12px;
+      background: rgba(212, 166, 79, 0.06);
+      border: 1px solid rgba(212, 166, 79, 0.22);
+      border-radius: 6px;
+    }
+    .editor-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .editor-label {
+      font-size: 0.74rem;
+      color: rgba(255, 255, 255, 0.55);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      min-width: 38px;
+    }
+    .editor-tool {
+      padding: 4px 10px;
+      font-size: 0.82rem;
+      min-height: 0;
+    }
+    .editor-tool.active {
+      background: rgba(212, 166, 79, 0.18);
+      border-color: rgba(212, 166, 79, 0.65);
+      color: var(--c-primary);
+    }
+    .editor-palette {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+    .palette-btn {
+      width: 30px;
+      height: 30px;
+      min-height: 0;
+      padding: 0;
+      font-family: ui-monospace, "SF Mono", monospace;
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: var(--atom-color, #fff);
+      border: 1.5px solid color-mix(in srgb, var(--atom-color, #fff) 50%, transparent);
+      background: color-mix(in srgb, var(--atom-color, #fff) 10%, transparent);
+    }
+    .palette-btn.active {
+      border-color: var(--atom-color, #fff);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--atom-color, #fff) 35%, transparent);
+      background: color-mix(in srgb, var(--atom-color, #fff) 22%, transparent);
+    }
+    #atom-state {
+      width: 56px;
+      padding: 4px 6px;
+      font-size: 0.86rem;
+    }
+    .editor-hint {
+      font-size: 0.74rem;
+      color: rgba(255, 220, 60, 0.85);
+      flex: 1 1 100%;
+    }
     .inspector-hint {
       font-size: 0.78rem;
       color: rgba(255, 255, 255, 0.55);
@@ -1137,11 +1201,38 @@
           <div class="inspector-side">
             <div class="inspector-stats" id="inspector-stats">No selection.</div>
             <div class="inspector-actions">
+              <button id="inspector-edit-toggle">✏️ Edit: OFF</button>
               <button id="inspector-download">💾 Download JSON</button>
               <button id="inspector-load">📂 Load JSON…</button>
             </div>
+            <div id="inspector-editor" class="inspector-editor" hidden>
+              <div class="editor-row">
+                <span class="editor-label">Tool</span>
+                <button class="editor-tool active" data-tool="add">＋ Add</button>
+                <button class="editor-tool" data-tool="bond">⎯ Bond</button>
+                <button class="editor-tool" data-tool="delete">✕ Delete</button>
+              </div>
+              <div class="editor-row">
+                <span class="editor-label">Atom</span>
+                <div class="editor-palette">
+                  <button class="palette-btn active" data-atom="a" style="--atom-color:#8a6d3b">a</button>
+                  <button class="palette-btn" data-atom="b" style="--atom-color:#7fb069">b</button>
+                  <button class="palette-btn" data-atom="c" style="--atom-color:#dca54c">c</button>
+                  <button class="palette-btn" data-atom="d" style="--atom-color:#d96d6d">d</button>
+                  <button class="palette-btn" data-atom="e" style="--atom-color:#c97df7">e</button>
+                  <button class="palette-btn" data-atom="f" style="--atom-color:#5db8d8">f</button>
+                  <button class="palette-btn" data-atom="w" style="--atom-color:#66ccff">w</button>
+                  <button class="palette-btn" data-atom="p" style="--atom-color:#ff8844">p</button>
+                </div>
+              </div>
+              <div class="editor-row">
+                <span class="editor-label">State</span>
+                <input type="number" id="atom-state" min="0" max="50" step="1" value="1">
+                <span class="editor-hint" id="editor-status">Click empty space in the canvas to drop an atom.</span>
+              </div>
+            </div>
             <div class="inspector-hint">
-              <strong>Compare across runs:</strong> save selections to JSON, reload them in a future sim, paste with <kbd>📥 Paste</kbd> in the panel — atoms drop at view center, bonds preserved.
+              <strong>Compare across runs:</strong> save selections to JSON, reload them in a future sim, paste with <kbd>📥 Paste</kbd> in the panel — atoms drop at view center, bonds preserved. Edits inside the inspector apply to the live sim too.
             </div>
           </div>
         </div>
