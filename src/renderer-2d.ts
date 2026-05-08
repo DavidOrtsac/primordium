@@ -13,6 +13,13 @@ const COLORS: Record<string, string> = {
   e: '#ff3333', f: '#33ff33', b: '#888888', c: '#00dddd',
   d: '#3366ff', p: '#ff7700', w: '#66ccff',
 };
+// Lab additions land here too so the educational 2D fallback colors
+// custom atoms the same way as the GPU path.
+export function setEducationalAtomColor(type: string, hex: string): void {
+  const reserved = new Set(['a','b','c','d','e','f','w','p','x','y','z']);
+  if (reserved.has(type)) return;
+  COLORS[type] = hex;
+}
 
 const LEGEND: { color: string; label: string; isLine?: boolean }[] = [
   { color: '#c8a800', label: 'a  membrane (bond line)', isLine: true },
@@ -587,6 +594,20 @@ const CLASSIC_COLORS: Record<string, string> = {
   a: '#c8a800', b: '#888888', c: '#00dddd', d: '#3366ff',
   e: '#ff3333', f: '#33ff33', p: '#ff7700', w: '#a8d8ff',
 };
+// Lab-defined atom colors layer on top of CLASSIC_COLORS via a runtime map.
+// Built-in keys can't be overwritten because the Lab UI rejects reserved
+// type symbols at registration time, but we still gate writes here as a
+// defense-in-depth measure.
+export function setClassicAtomColor(type: string, hex: string): void {
+  const reserved = new Set(['a','b','c','d','e','f','w','p','x','y','z']);
+  if (reserved.has(type)) return;
+  CLASSIC_COLORS[type] = hex;
+}
+export function clearCustomClassicColors(): void {
+  for (const k of Object.keys(CLASSIC_COLORS)) {
+    if (!'abcdefwp'.includes(k)) delete CLASSIC_COLORS[k];
+  }
+}
 
 export function draw2DClassic(
   ctx: CanvasRenderingContext2D,

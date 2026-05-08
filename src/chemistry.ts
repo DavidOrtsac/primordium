@@ -154,7 +154,16 @@ function tryReactionWithProducts(
 }
 
 export class Chemistry {
+  // Built-in reactions seeded by initSimple() in init.ts. Treated as
+  // immutable from the user's perspective — their custom rules can never
+  // remove or override these. Maintained as a separate array from custom
+  // so rebuilds (mode change, reseed) can re-apply customs cleanly without
+  // touching the built-in chemistry.
   private reactions: Reaction[] = [];
+  // User-defined reactions appended via the Lab UI. Iterated AFTER built-ins
+  // each react() call; built-ins always win on a tie. Replaceable wholesale
+  // via setCustom() so the editor can ship a new list without leaks.
+  private customReactions: Reaction[] = [];
   mutationRate = 0; // legacy wild-mode knob; superseded by NoiseConfig
 
   add(r: Reaction): void {
@@ -165,6 +174,15 @@ export class Chemistry {
     this.reactions.length = 0;
   }
 
+  // Replace the entire custom-rule list. Built-ins are untouched, so a bad
+  // custom rule list can't corrupt the seeded chemistry — at worst it's
+  // ignored or overshadowed by a built-in match.
+  setCustom(rules: Reaction[]): void {
+    this.customReactions = rules.slice();
+  }
+  clearCustom(): void { this.customReactions.length = 0; }
+  customCount(): number { return this.customReactions.length; }
+
   react(
     cell: Cell, nearby: Cell[], reactionRange2: number,
     noise?: NoiseConfig, log?: EventLog, iter?: number,
@@ -173,6 +191,7 @@ export class Chemistry {
     _ctxCfg  = noise ?? DEFAULT_NOISE;
     _ctxLog  = log ?? null;
     _ctxIter = iter ?? 0;
+    // Built-ins first — guaranteed precedence over anything the user added.
     for (const rxn of this.reactions) {
       const fired = (noise && log)
         ? tryReactionWithProducts(cell, nearby, rxn, reactionRange2)
@@ -183,6 +202,23 @@ export class Chemistry {
           legacyMutate(cell);
         }
         // Primitive-level copy misfire — the principled noise source.
+        if (noise && log && _lastProducts.length > 0) {
+          applyCopyMisfire(noise, log, iter ?? 0, _lastProducts);
+        }
+        _ctxLog = null;
+        return true;
+      }
+    }
+    // Custom user-defined rules — ALWAYS run after built-ins. A custom rule
+    // can fire only if no built-in matched this pair this tick.
+    for (const rxn of this.customReactions) {
+      const fired = (noise && log)
+        ? tryReactionWithProducts(cell, nearby, rxn, reactionRange2)
+        : tryReaction(cell, nearby, rxn, reactionRange2);
+      if (fired) {
+        if (this.mutationRate > 0 && Math.random() < this.mutationRate) {
+          legacyMutate(cell);
+        }
         if (noise && log && _lastProducts.length > 0) {
           applyCopyMisfire(noise, log, iter ?? 0, _lastProducts);
         }

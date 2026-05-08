@@ -26,7 +26,9 @@ import {
   SaveState, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, STRIDE,
   packTypeState, allocAtomsBuffer, allocAtomIdsBuffer, allocLoopsBuffer, allocBondsBuffer, allocDropletsBuffer,
   MAX_ATOMS, MAX_LOOP_VERTS_TOTAL, MAX_BONDS, MAX_DROPLETS,
+  CustomAtomDef, CustomRuleSpec,
 } from './snapshot';
+import { r2, r3 } from './reaction';
 import { NoiseConfig, EventLog, DEFAULT_NOISE } from './noise';
 import { HydrolysisConfig, DEFAULT_HYDROLYSIS, generateWaterForDroplet, generateWaterForAllDroplets, removeAllWater } from './hydrolysis';
 
@@ -137,6 +139,58 @@ let burnTarget = 0;
 // Cell refs so post-tick spatial-hash shuffles don't desync. Flag bit 4 on
 // the snapshot is set for every atom in the set, drawing a halo per atom.
 let selectedSet: Set<Cell> = new Set();
+
+// User-defined chemistry — held on the worker so chemistry rebuilds (mode
+// change, reseed, save-load) re-apply them automatically. Reserved labels
+// are filtered before compile so junk can never leak into the matcher.
+let customAtoms: CustomAtomDef[] = [];
+let customRuleSpecs: CustomRuleSpec[] = [];
+const RESERVED_TYPES = new Set(['a', 'b', 'c', 'd', 'e', 'f', 'w', 'p', 'x', 'y', 'z']);
+function isValidCustomType(t: string): boolean {
+  if (!t || t.length !== 1) return false;
+  if (RESERVED_TYPES.has(t)) return false;
+  return /^[A-Z0-9]$/.test(t);
+}
+function isAlphabetType(t: string): boolean {
+  // Types accepted as REACTANTS in custom rules — built-in atoms, wildcards,
+  // and any currently-defined custom atom.
+  if (!t || t.length !== 1) return false;
+  if (RESERVED_TYPES.has(t)) return true;
+  return customAtoms.some(a => a.type === t);
+}
+function compileCustomRule(spec: CustomRuleSpec) {
+  // Validate before constructing the Reaction. Bad specs are dropped with a
+  // warning rather than throwing — a single malformed rule shouldn't kill
+  // the whole user-defined chemistry.
+  if (!isAlphabetType(spec.aType) || !isAlphabetType(spec.bType)) return null;
+  const aS = spec.aState | 0, bS = spec.bState | 0;
+  const fA = spec.futureAState | 0, fB = spec.futureBState | 0;
+  const cases = Math.max(1, spec.cases | 0);
+  if (spec.nInputs === 3) {
+    if (!spec.cType || !isAlphabetType(spec.cType)) return null;
+    return r3(
+      spec.aType, aS, !!spec.currentAbBond,
+      spec.bType, bS, !!spec.currentBcBond,
+      spec.cType, ((spec.cState ?? 0) | 0), !!spec.currentAcBond,
+      fA, !!spec.futureAbBond,
+      fB, !!spec.futureBcBond,
+      ((spec.futureCState ?? 0) | 0), !!spec.futureAcBond,
+      cases,
+    );
+  }
+  return r2(
+    spec.aType, aS, !!spec.currentAbBond,
+    spec.bType, bS,
+    fA, !!spec.futureAbBond,
+    fB, false,
+    cases,
+  );
+}
+function applyCustomChemistryToCurrentGrid(): number {
+  const compiled = customRuleSpecs.map(compileCustomRule).filter(r => r !== null);
+  grid.getChemistry().setCustom(compiled as ReturnType<typeof r2>[]);
+  return compiled.length;
+}
 const SOUP_RESPAWN_INTERVAL   = 700;   // ticks between soup waves
 const SOUP_RESPAWN_PATCHES    = 5;
 const SOUP_RESPAWN_PER_PATCH  = 90;    // 5 × 90 = 450 atoms per wave
@@ -259,6 +313,7 @@ function setupGame(): void {
       );
     }
   }
+  applyCustomChemistryToCurrentGrid();
 }
 
 function setupRigged(): void {
@@ -279,6 +334,7 @@ function setupRigged(): void {
     [gridW * 0.76, midY],
     [gridW * 0.92, midY],
   ], 0);
+  applyCustomChemistryToCurrentGrid();
 }
 
 function setupWild(): void {
@@ -287,6 +343,7 @@ function setupWild(): void {
   attachNoiseToGrid();
   grid.create(gridW, gridH);
   initWild(grid, WILD_ATOM_COUNT);
+  applyCustomChemistryToCurrentGrid();
 }
 
 // ── Loop detection (membrane closed cycles via 'a'-'a' bond chains) ────────
@@ -628,6 +685,7 @@ function loadSaveState(s: SaveState): string | null {
   grid.energyEnabled = false;
   grid.getChemistry().mutationRate = 0;
   initSimple(grid, [], 0); // re-register chemistry rules without seeding any cells
+  applyCustomChemistryToCurrentGrid();
 
   const newCells: Cell[] = [];
   let maxId = 0;
@@ -1047,6 +1105,35 @@ self.onmessage = (e: MessageEvent<unknown>) => {
         if (a.bonds.has(b)) a.debond(b); else a.bondTo(b);
       }
       postSnapshotIfPaused();
+      return;
+    }
+    case 'setCustomAtoms': {
+      // Replace the entire custom atom registry. Validation here keeps the
+      // worker side robust — even if the UI ships malformed defs we drop
+      // the bad ones rather than corrupting state.
+      const filtered: CustomAtomDef[] = [];
+      const seen = new Set<string>();
+      for (const a of msg.atoms) {
+        if (!a || typeof a.type !== 'string') continue;
+        if (!isValidCustomType(a.type)) continue;
+        if (seen.has(a.type)) continue;
+        seen.add(a.type);
+        filtered.push({
+          type: a.type,
+          name: typeof a.name === 'string' ? a.name : a.type,
+          color: typeof a.color === 'string' ? a.color : '#cccccc',
+          defaultState: Math.max(0, Math.min(50, a.defaultState | 0)),
+        });
+      }
+      customAtoms = filtered;
+      // Re-validate every custom rule against the new atom registry — a rule
+      // referencing a deleted custom atom would silently fail to compile.
+      applyCustomChemistryToCurrentGrid();
+      return;
+    }
+    case 'setCustomRules': {
+      customRuleSpecs = Array.isArray(msg.rules) ? msg.rules.slice() : [];
+      applyCustomChemistryToCurrentGrid();
       return;
     }
     case 'replaceAtomType': {
