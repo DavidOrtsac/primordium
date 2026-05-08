@@ -920,6 +920,101 @@
       color: rgba(255, 220, 60, 0.85);
       flex: 1 1 100%;
     }
+    .lab-tabs {
+      display: flex;
+      gap: 4px;
+      padding: 8px 14px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .lab-tab {
+      background: transparent;
+      border: 1px solid transparent;
+      border-bottom: none;
+      border-radius: 6px 6px 0 0;
+      padding: 6px 14px;
+      color: rgba(255, 255, 255, 0.55);
+      font-size: 0.86rem;
+      cursor: pointer;
+    }
+    .lab-tab:hover { color: rgba(255, 255, 255, 0.85); }
+    .lab-tab.active {
+      color: var(--c-mutation);
+      background: rgba(201, 125, 247, 0.08);
+      border-color: rgba(201, 125, 247, 0.30);
+    }
+    .dict-entry {
+      display: flex;
+      gap: 12px;
+      padding: 12px;
+      margin-bottom: 8px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 6px;
+    }
+    .dict-icon {
+      flex: 0 0 auto;
+      width: 44px; height: 44px;
+      border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.18);
+      display: flex; align-items: center; justify-content: center;
+      font-family: ui-monospace, "SF Mono", monospace;
+      font-weight: 700;
+      font-size: 1.4rem;
+      color: rgba(0, 0, 0, 0.7);
+    }
+    .dict-meta { flex: 1 1 auto; min-width: 0; }
+    .dict-name {
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.95);
+      font-size: 0.96rem;
+    }
+    .dict-tag {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 1px 7px;
+      border-radius: 10px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .dict-tag.builtin {
+      background: rgba(212, 166, 79, 0.16);
+      border: 1px solid rgba(212, 166, 79, 0.4);
+      color: var(--c-primary);
+    }
+    .dict-tag.custom {
+      background: rgba(201, 125, 247, 0.16);
+      border: 1px solid rgba(201, 125, 247, 0.4);
+      color: var(--c-mutation);
+    }
+    .dict-desc {
+      margin-top: 6px;
+      font-size: 0.86rem;
+      color: rgba(255, 255, 255, 0.78);
+      line-height: 1.5;
+    }
+    .dict-rules {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed rgba(255, 255, 255, 0.08);
+    }
+    .dict-rules-title {
+      font-size: 0.74rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.45);
+      margin-bottom: 4px;
+    }
+    .dict-rule {
+      font-size: 0.82rem;
+      color: rgba(255, 255, 255, 0.72);
+      padding: 4px 0;
+      line-height: 1.45;
+    }
+    .dict-rule strong { color: rgba(255, 220, 140, 0.95); font-weight: 600; }
+    .dict-rule .none { color: rgba(255, 255, 255, 0.4); font-style: italic; }
+
     /* Lab modal — custom chemistry editor */
     .lab-body {
       padding: 14px 18px;
@@ -1300,7 +1395,11 @@
           <span class="inspector-title">⚗️ Custom Chemistry Editor</span>
           <button id="lab-close" class="panel-close" aria-label="Close lab" title="Close (Esc)">✕</button>
         </div>
-        <div class="lab-body">
+        <div class="lab-tabs">
+          <button class="lab-tab active" data-tab="editor">🛠️ Editor</button>
+          <button class="lab-tab" data-tab="dictionary">📖 Dictionary</button>
+        </div>
+        <div class="lab-body" id="lab-tab-editor">
           <div class="lab-section">
             <div class="lab-section-title">Custom Atoms</div>
             <div class="lab-section-hint">Built-in atoms (a/b/c/d/e/f/w/p) and wildcards (x/y/z) are reserved. New atoms get an uppercase letter or digit. Without rules they're inert decoration.</div>
@@ -1364,6 +1463,13 @@
               </div>
             </div>
             <div class="lab-list" id="custom-rule-list"></div>
+          </div>
+        </div>
+        <div class="lab-body" id="lab-tab-dictionary" hidden>
+          <div class="lab-section">
+            <div class="lab-section-title">📖 Atom Dictionary</div>
+            <div class="lab-section-hint">Every atom in the sim, in plain English. Built-ins are explained from first principles. Custom atoms get auto-generated descriptions from the rules you wrote — no AI, just templated translations of the math.</div>
+            <div id="dictionary-list"></div>
           </div>
         </div>
       </div>
