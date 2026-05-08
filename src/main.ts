@@ -960,6 +960,11 @@ const ATOM_COLORS: Record<string, string> = {
   a: '#8a6d3b', b: '#7fb069', c: '#dca54c', d: '#d96d6d',
   e: '#c97df7', f: '#5db8d8', w: '#66ccff', p: '#ff8844',
 };
+// Inspector view transform — saved here so the click handlers can reverse
+// canvas pixels back to world coords (for "where did the user click?")
+// and forward atoms to canvas coords (for hit-testing).
+let inspectorTx: { cx: number; cy: number; scale: number; W: number; H: number; r: number } | null = null;
+
 function renderInspector(sel: SelectionState): void {
   if (!inspectorCanvas || !inspectorStats) return;
   const ctx = inspectorCanvas.getContext('2d');
@@ -968,10 +973,14 @@ function renderInspector(sel: SelectionState): void {
   ctx.clearRect(0, 0, W, H);
 
   if (sel.atomCount === 0) {
-    inspectorStats.textContent = 'Empty selection — pick something with the Select brush first.';
+    inspectorStats.textContent = editMode
+      ? 'Empty canvas — click anywhere to drop your first atom.'
+      : 'Empty selection — pick something with the Select brush first.';
+    inspectorTx = editMode ? { cx: GRID_W / 2, cy: GRID_H / 2, scale: 1, W, H, r: 6 } : null;
     return;
   }
-  // Compute bounding box for fit-to-canvas scaling.
+  // Compute bounding box for fit-to-canvas scaling. Pad by atom radius so
+  // outermost atoms aren't clipped at the canvas edge.
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let i = 0; i < sel.atomCount; i++) {
     if (sel.cellX[i] < minX) minX = sel.cellX[i];
@@ -985,6 +994,7 @@ function renderInspector(sel: SelectionState): void {
   const tx = (x: number) => (x - cx) * scale + W / 2;
   const ty = (y: number) => (y - cy) * scale + H / 2;
   const r = Math.max(2.5, 6 * scale);
+  inspectorTx = { cx, cy, scale, W, H, r };
 
   // Bonds underlay.
   ctx.lineWidth = Math.max(1, r * 0.45);
@@ -1068,6 +1078,184 @@ if (inspectorDownload) inspectorDownload.addEventListener('click', downloadSelec
 if (inspectorLoad) inspectorLoad.addEventListener('click', () => selectionFileInput.click());
 if (inspectBtn) inspectBtn.addEventListener('click', openInspector);
 if (pasteBtn) pasteBtn.addEventListener('click', pastePendingSelection);
+
+// ── Inspector edit mode ───────────────────────────────────────────────────
+// Toggle between read-only study view and an active CAD-style editor.
+// In edit mode the user can drop new atoms from a palette, draw bonds,
+// and delete atoms — every change goes through the worker so the live
+// sim reflects the edit immediately. After each edit we re-request the
+// selection export to pull fresh IDs/positions back into the inspector.
+type EditTool = 'add' | 'bond' | 'delete';
+let editMode = false;
+let editTool: EditTool = 'add';
+let editAtomType = 'a';
+// First-click atom in a Bond gesture. Cleared on second click or Esc.
+let bondPendingId: number | null = null;
+
+const editToggleBtn  = document.getElementById('inspector-edit-toggle') as HTMLButtonElement | null;
+const editorPanel    = document.getElementById('inspector-editor')      as HTMLDivElement | null;
+const atomStateInput = document.getElementById('atom-state')            as HTMLInputElement | null;
+const editorStatus   = document.getElementById('editor-status')         as HTMLSpanElement | null;
+const toolBtns       = document.querySelectorAll<HTMLButtonElement>('.editor-tool');
+const paletteBtns    = document.querySelectorAll<HTMLButtonElement>('.palette-btn');
+
+// Per-type sensible default state. Snaps the state input when the user
+// picks a palette atom — they can still override for advanced edits.
+const DEFAULT_STATE: Record<string, number> = {
+  a: 1, b: 0, c: 0, d: 0, e: 0, f: 0, w: 0, p: 0,
+};
+
+function setEditorStatus(msg: string): void {
+  if (editorStatus) editorStatus.textContent = msg;
+}
+function refreshEditorStatus(): void {
+  if (!editMode) return;
+  if (editTool === 'add') {
+    setEditorStatus(`Click empty space to drop "${editAtomType}" (state ${atomStateInput?.value ?? 0}).`);
+  } else if (editTool === 'bond') {
+    setEditorStatus(bondPendingId === null
+      ? 'Click first atom for a bond.'
+      : 'Click second atom (same atom or Esc to cancel).');
+  } else if (editTool === 'delete') {
+    setEditorStatus('Click an atom to remove it from the sim.');
+  }
+}
+function setEditTool(t: EditTool): void {
+  editTool = t;
+  bondPendingId = null;
+  toolBtns.forEach(b => b.classList.toggle('active', b.dataset.tool === t));
+  refreshEditorStatus();
+}
+function setPaletteAtom(t: string): void {
+  editAtomType = t;
+  paletteBtns.forEach(b => b.classList.toggle('active', b.dataset.atom === t));
+  if (atomStateInput && DEFAULT_STATE[t] !== undefined) {
+    atomStateInput.value = String(DEFAULT_STATE[t]);
+  }
+  refreshEditorStatus();
+}
+function setEditMode(on: boolean): void {
+  editMode = on;
+  if (editToggleBtn) {
+    editToggleBtn.textContent = on ? '✏️ Edit: ON' : '✏️ Edit: OFF';
+    editToggleBtn.classList.toggle('active', on);
+  }
+  if (editorPanel) editorPanel.hidden = !on;
+  if (inspectorCanvas) inspectorCanvas.style.cursor = on ? 'crosshair' : 'default';
+  bondPendingId = null;
+  if (on) {
+    refreshEditorStatus();
+    // Re-render so the empty-state hint switches to the edit-friendly
+    // copy if there's no current selection.
+    if (lastSelection) renderInspector(lastSelection);
+    else renderInspector(emptySelection());
+  } else {
+    setEditorStatus('');
+  }
+}
+
+function emptySelection(): SelectionState {
+  return {
+    magic: 'primordium-selection',
+    version: 1,
+    savedAt: new Date().toISOString(),
+    atomCount: 0,
+    cellX: [], cellY: [], cellType: [], cellState: [], cellId: [], bonds: [],
+  };
+}
+
+// Map an inspector-canvas pixel back to world coordinates using the
+// transform captured during the last render. Returns null if no atoms
+// have been rendered yet (transform unknown).
+function inspectorPixelToWorld(px: number, py: number): { x: number; y: number } | null {
+  if (!inspectorTx) return null;
+  const { cx, cy, scale, W, H } = inspectorTx;
+  return { x: (px - W / 2) / scale + cx, y: (py - H / 2) / scale + cy };
+}
+// Find the atom under an inspector pixel (within a hit radius). Returns
+// the index into lastSelection arrays, or -1 if nothing is close enough.
+function hitAtomInInspector(px: number, py: number): number {
+  if (!inspectorTx || !lastSelection) return -1;
+  const { cx, cy, scale, W, H, r } = inspectorTx;
+  const hitR = Math.max(8, r + 4);
+  const hitR2 = hitR * hitR;
+  let best = -1, bestD2 = Infinity;
+  for (let i = 0; i < lastSelection.atomCount; i++) {
+    const ax = (lastSelection.cellX[i] - cx) * scale + W / 2;
+    const ay = (lastSelection.cellY[i] - cy) * scale + H / 2;
+    const dx = px - ax, dy = py - ay;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < hitR2 && d2 < bestD2) { bestD2 = d2; best = i; }
+  }
+  return best;
+}
+// After every edit, re-request the selection so the inspector view
+// (and stats) reflect the new state. The worker pushes back via
+// onSelectionExport, which calls renderInspector.
+function refreshSelectionFromWorker(): void {
+  send({ type: 'exportSelection' });
+}
+
+if (inspectorCanvas) {
+  inspectorCanvas.addEventListener('click', (e) => {
+    if (!editMode) return;
+    const rect = inspectorCanvas.getBoundingClientRect();
+    // Account for CSS scaling — canvas internal is 320, displayed size may differ on small screens.
+    const px = (e.clientX - rect.left) * (inspectorCanvas.width / rect.width);
+    const py = (e.clientY - rect.top)  * (inspectorCanvas.height / rect.height);
+
+    if (editTool === 'add') {
+      const w = inspectorPixelToWorld(px, py);
+      if (!w) {
+        setEditorStatus('Cannot resolve world coordinates yet — try after a selection exists.');
+        return;
+      }
+      const state = Math.max(0, Math.min(50, parseInt(atomStateInput?.value ?? '0', 10) || 0));
+      send({ type: 'editAddAtom', x: w.x, y: w.y, atomType: editAtomType, state });
+      refreshSelectionFromWorker();
+      setEditorStatus(`Added "${editAtomType}" (state ${state}).`);
+      return;
+    }
+    if (editTool === 'delete') {
+      const idx = hitAtomInInspector(px, py);
+      if (idx < 0 || !lastSelection || !lastSelection.cellId) {
+        setEditorStatus('No atom under cursor.'); return;
+      }
+      const id = lastSelection.cellId[idx];
+      send({ type: 'editDeleteAtom', atomId: id });
+      refreshSelectionFromWorker();
+      setEditorStatus(`Deleted atom #${id}.`);
+      return;
+    }
+    if (editTool === 'bond') {
+      const idx = hitAtomInInspector(px, py);
+      if (idx < 0 || !lastSelection || !lastSelection.cellId) {
+        setEditorStatus('No atom under cursor.'); return;
+      }
+      const id = lastSelection.cellId[idx];
+      if (bondPendingId === null) {
+        bondPendingId = id;
+        setEditorStatus(`Picked atom #${id} — click a second atom to toggle the bond (Esc cancels).`);
+        return;
+      }
+      if (bondPendingId === id) {
+        bondPendingId = null;
+        setEditorStatus('Bond gesture cancelled.');
+        return;
+      }
+      send({ type: 'editToggleBond', atomIdA: bondPendingId, atomIdB: id });
+      const a = bondPendingId; bondPendingId = null;
+      refreshSelectionFromWorker();
+      setEditorStatus(`Toggled bond #${a} ↔ #${id}.`);
+      return;
+    }
+  });
+}
+
+if (editToggleBtn) editToggleBtn.addEventListener('click', () => setEditMode(!editMode));
+toolBtns.forEach(b => b.addEventListener('click', () => setEditTool(b.dataset.tool as EditTool)));
+paletteBtns.forEach(b => b.addEventListener('click', () => setPaletteAtom(b.dataset.atom ?? 'a')));
+if (atomStateInput) atomStateInput.addEventListener('input', refreshEditorStatus);
 // Freeze — the panic button. Pause the sim, zero all noise sliders (without
 // losing their slider positions), and quicksave. One key for "I see something
 // interesting, capture it now and stop the world from changing."
@@ -1631,8 +1819,13 @@ document.addEventListener('keydown', (e) => {
     pushPlayerInput();
     return;
   }
-  // Esc: close the inspector first, then panel, then reset brush.
+  // Esc: cancel a pending bond → close inspector → close panel → reset brush.
   if (e.code === 'Escape') {
+    if (isInspectorOpen() && bondPendingId !== null) {
+      bondPendingId = null;
+      setEditorStatus('Bond gesture cancelled.');
+      return;
+    }
     if (isInspectorOpen()) { closeInspector(); return; }
     if (isPanelOpen()) { closePanel(); return; }
     setBrush('pan');

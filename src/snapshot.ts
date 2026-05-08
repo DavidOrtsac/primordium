@@ -65,6 +65,9 @@ export type ControlMsg =
   | { type: 'deleteSelected' }
   | { type: 'exportSelection' }
   | { type: 'pasteSelection'; x: number; y: number; selection: SelectionState }
+  | { type: 'editAddAtom'; x: number; y: number; atomType: string; state: number }
+  | { type: 'editDeleteAtom'; atomId: number }
+  | { type: 'editToggleBond'; atomIdA: number; atomIdB: number }
   | { type: 'setNoise'; enabled: boolean; copyFidelity: number; decayRate: number; bondFailRate: number }
   | { type: 'setHydrolysis'; enabled: boolean; baseRate: number; waterDensity: number }
   | { type: 'requestEventLog' }
@@ -139,6 +142,11 @@ export type SelectionState = {
   cellY: number[];
   cellType: string[];
   cellState: number[];
+  // Stable atom IDs from the worker, parallel to cellX/Y. Lets the
+  // inspector address specific atoms when issuing live edits (delete,
+  // bond toggle). Optional in saved JSON for back-compat — when absent
+  // (loaded from older files) edits are disabled until re-selected.
+  cellId?: number[];
   bonds: number[]; // flat [i0,j0, i1,j1, ...] with i < j
 };
 

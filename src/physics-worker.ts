@@ -1001,9 +1001,52 @@ self.onmessage = (e: MessageEvent<unknown>) => {
         cellY:    arr.map(c => c.loc.y),
         cellType: arr.map(c => c.type),
         cellState: arr.map(c => c.state),
+        cellId:   arr.map(c => c.id),
         bonds: localBonds,
       };
       self.postMessage({ type: 'selectionExport', selection });
+      return;
+    }
+    case 'editAddAtom': {
+      // Inspector edit: spawn a new atom at world coords and add it to
+      // the live selection so the user sees their additions both in the
+      // inspector preview and in the running sim. Type is validated
+      // against the chemistry alphabet — anything unrecognized is a
+      // no-op (keeps malformed messages from corrupting the grid).
+      const allowed = 'abcdefwp';
+      if (!msg.atomType || allowed.indexOf(msg.atomType) === -1) return;
+      const x = Math.max(0, Math.min(gridW, msg.x));
+      const y = Math.max(0, Math.min(gridH, msg.y));
+      const state = Math.max(0, Math.min(50, msg.state | 0));
+      const c = grid.createCell(x, y, msg.atomType, state);
+      selectedSet.add(c);
+      postSnapshotIfPaused();
+      return;
+    }
+    case 'editDeleteAtom': {
+      // Find the cell by stable ID *within the current selection*. Edits
+      // can only operate on selected atoms; this prevents stray IDs from
+      // an outdated inspector view from deleting unrelated cells.
+      let target: Cell | null = null;
+      for (const c of selectedSet) { if (c.id === msg.atomId) { target = c; break; } }
+      if (target) {
+        grid.removeCell(target);
+        selectedSet.delete(target);
+      }
+      postSnapshotIfPaused();
+      return;
+    }
+    case 'editToggleBond': {
+      let a: Cell | null = null, b: Cell | null = null;
+      for (const c of selectedSet) {
+        if (c.id === msg.atomIdA) a = c;
+        else if (c.id === msg.atomIdB) b = c;
+        if (a && b) break;
+      }
+      if (a && b && a !== b) {
+        if (a.bonds.has(b)) a.debond(b); else a.bondTo(b);
+      }
+      postSnapshotIfPaused();
       return;
     }
     case 'pasteSelection': {
