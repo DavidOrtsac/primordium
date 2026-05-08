@@ -779,6 +779,99 @@
       pointer-events: auto;
     }
 
+    /* Inspector — read-only modal overlay sitting on top of the sim.
+       The sim keeps running underneath; the inspector renders the
+       frozen selection it received from the worker on Open. */
+    .inspector {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(8, 12, 22, 0.72);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      z-index: 70;
+      padding: 20px;
+    }
+    .inspector.shown { display: flex; }
+    .inspector-card {
+      width: min(720px, 100%);
+      max-height: 100%;
+      background: rgba(15, 22, 36, 0.96);
+      border: 1px solid rgba(212, 166, 79, 0.45);
+      border-radius: 12px;
+      box-shadow: 0 20px 60px -20px rgba(0, 0, 0, 0.7);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      line-height: 1.5;
+    }
+    .inspector-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .inspector-title {
+      font-weight: 600;
+      color: var(--c-primary);
+      letter-spacing: 0.02em;
+    }
+    .inspector-body {
+      display: flex;
+      gap: 16px;
+      padding: 16px;
+      overflow: auto;
+    }
+    #inspector-canvas {
+      flex: 0 0 auto;
+      width: 320px;
+      height: 320px;
+      background: #0a0e18;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 8px;
+    }
+    .inspector-side {
+      flex: 1 1 auto;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .inspector-stats {
+      font-family: ui-monospace, "SF Mono", monospace;
+      font-size: 0.82rem;
+      color: rgba(255, 255, 255, 0.86);
+      background: rgba(0, 0, 0, 0.28);
+      padding: 10px 12px;
+      border-radius: 6px;
+      white-space: pre-wrap;
+      max-height: 180px;
+      overflow: auto;
+    }
+    .inspector-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .inspector-hint {
+      font-size: 0.78rem;
+      color: rgba(255, 255, 255, 0.55);
+    }
+    .inspector-hint kbd {
+      font-size: 0.74rem;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+    }
+    @media (max-width: 600px) {
+      .inspector-body { flex-direction: column; align-items: center; }
+      #inspector-canvas { width: 260px; height: 260px; }
+    }
+
     /* Shortcut badges — small key caps shown in the corner of any button
        that has a keyboard shortcut. Inline-flex so they sit cleanly
        next to the button label without disrupting layout. */
@@ -1030,6 +1123,31 @@
          whole page. -->
     <div id="panel-backdrop" class="control-panel-backdrop" aria-hidden="true"></div>
 
+    <!-- INSPECTOR MODAL — frozen view of the current selection, lives
+         inside scope-frame so it overlays only the sim, not the page.
+         Sim keeps running underneath; this is a read-only study tool. -->
+    <div id="inspector" class="inspector" aria-hidden="true">
+      <div class="inspector-card">
+        <div class="inspector-header">
+          <span class="inspector-title">🔬 Selection Inspector</span>
+          <button id="inspector-close" class="panel-close" aria-label="Close inspector" title="Close (Esc)">✕</button>
+        </div>
+        <div class="inspector-body">
+          <canvas id="inspector-canvas" width="320" height="320"></canvas>
+          <div class="inspector-side">
+            <div class="inspector-stats" id="inspector-stats">No selection.</div>
+            <div class="inspector-actions">
+              <button id="inspector-download">💾 Download JSON</button>
+              <button id="inspector-load">📂 Load JSON…</button>
+            </div>
+            <div class="inspector-hint">
+              <strong>Compare across runs:</strong> save selections to JSON, reload them in a future sim, paste with <kbd>📥 Paste</kbd> in the panel — atoms drop at view center, bonds preserved.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- THE control panel. Lives INSIDE the canvas frame so it overlays
          only the simulation window, not the entire viewport. Slides in
          from the right edge of the canvas. -->
@@ -1151,6 +1269,20 @@
           <span class="val" id="hydro-density-val">0.0010</span>
         </label>
       </span>
+    </div>
+
+    <!-- INSPECTOR — selection studio (deep dive on whatever you've selected) -->
+    <div class="card card--inspector">
+      <div class="card__label">🔬 Inspector</div>
+      <div class="card__row">
+        <button id="inspect-btn">Open inspector<span class="kbd-badge">I</span></button>
+      </div>
+      <div class="card__row">
+        <button id="paste-btn">📥 Paste from JSON</button>
+      </div>
+      <div class="card__row">
+        <span class="ctl-label" id="selection-count">No selection · use the Select brush, then click any atom</span>
+      </div>
     </div>
 
     <!-- ARCHIVE — saves, loads, exports -->
