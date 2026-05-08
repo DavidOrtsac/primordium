@@ -1741,6 +1741,251 @@ function isLabOpen(): boolean {
 if (labOpenBtn) labOpenBtn.addEventListener('click', openLab);
 if (labCloseBtn) labCloseBtn.addEventListener('click', closeLab);
 
+// ── Lab tabs (Editor / Dictionary) ────────────────────────────────────────
+const labTabs = document.querySelectorAll<HTMLButtonElement>('.lab-tab');
+const labTabEditor = document.getElementById('lab-tab-editor');
+const labTabDictionary = document.getElementById('lab-tab-dictionary');
+function showLabTab(name: string): void {
+  labTabs.forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  if (labTabEditor)     labTabEditor.hidden     = name !== 'editor';
+  if (labTabDictionary) labTabDictionary.hidden = name !== 'dictionary';
+  if (name === 'dictionary') rebuildDictionary();
+}
+labTabs.forEach(b => b.addEventListener('click', () => showLabTab(b.dataset.tab ?? 'editor')));
+
+// ── Dictionary: rule-to-English compiler ──────────────────────────────────
+// Templated translation, no LLM. Reads a CustomRuleSpec and emits a plain
+// sentence describing what the rule does. Built-in atoms get hand-written
+// dictionary entries; custom atoms get auto-generated descriptions built
+// from the rules that reference them.
+
+const BUILTIN_DICTIONARY: Record<string, { name: string; color: string; description: string }> = {
+  a: {
+    name: 'Membrane unit (a)',
+    color: '#c8a800',
+    description:
+      'The structural building block of cell walls. When many "a" atoms bond into a closed loop, that loop IS the cell membrane — it physically holds the cell together. Lysin (p) breaks a-a bonds, splitting the wall open. Water (w) hydrolyzes them too, slowly digesting dead cells. In a special state (38), an "a" atom doubles as a gene base inside DNA strands. Closest real-world analogue: peptidoglycan, the rigid polymer in bacterial cell walls.',
+  },
+  b: {
+    name: 'Common gene base (b)',
+    color: '#888888',
+    description:
+      'The most frequent base in the genome strand. Appears three times in the seeded gene template (e-b-b-a-c-b-d-f). The polymerase enzyme (d) walks past it without doing anything special — it\'s the cheap filler base. Closest real-world analogue: adenine or thymine in DNA.',
+  },
+  c: {
+    name: 'Rare gene base (c)',
+    color: '#00dddd',
+    description:
+      'A less common gene base. Appears once in the default gene template, alongside the "b" filler. Functionally identical to "b" from the chemistry\'s perspective — the polymerase reads it the same way — but rarer. Closest real-world analogue: cytosine or guanine.',
+  },
+  d: {
+    name: 'Polymerase enzyme (d)',
+    color: '#3366ff',
+    description:
+      'A walking molecular machine. Free "d" atoms float in the soup. When one bumps into a gene start, it enters "walking" state (state 41) and steps along the template, copying state forward base-by-base. Releases when it hits the gene end (f). Note: "d" is BOTH the enzyme AND a residue inside the gene that encodes itself — exactly like real DNA polymerase, which is encoded in the chromosome it replicates.',
+  },
+  e: {
+    name: 'Gene start, anchored to membrane (e)',
+    color: '#ff3333',
+    description:
+      'Marks one end of the gene strand and is bonded to a special "T-tagged" membrane atom. This bond physically tethers the chromosome to the cell wall — the same way bacterial chromosomes are anchored to the membrane at the origin of replication (oriC). When replication starts, it starts here.',
+  },
+  f: {
+    name: 'Gene end, division trigger (f)',
+    color: '#33ff33',
+    description:
+      'Marks the other end of the gene strand and anchors to the opposite side of the membrane. When the polymerase reaches an "f", it releases the strand AND triggers the cascade of reactions that splits one cell into two daughter cells. Closest real-world analogue: the ter site + FtsZ divisome in bacteria.',
+  },
+  w: {
+    name: 'Water (w)',
+    color: '#a8d8ff',
+    description:
+      'Free H2O. Confined to droplets by an invisible surface tension. When fresh (state 0), water can break ONE non-protected bond per tick, then transitions to spent (state 1) and can never hydrolyze again. Mass-conserving: no atom is ever deleted, water just gets chemically incorporated into the broken bond as the cleaved -OH and H groups. Cells protected by their live-cell membrane signature are immune.',
+  },
+  p: {
+    name: 'Lysin (p)',
+    color: '#ff7700',
+    description:
+      'A catalyst enzyme that cleaves membrane (a-a) bonds when free. Stays state 0 always — never consumed, just speeds up the reaction. Crucial detail: lysin is ONLY active when unbonded. Force-bonding lysin to a membrane atom (or to other lysins) makes it a catalytically inert ornament. Closest real-world analogue: lysozyme in tears + saliva, or phage endolysin used in modern enzybiotic research.',
+  },
+};
+
+function atomShortName(t: string): string {
+  if ('xyz'.includes(t)) return `any-atom-${t}`;
+  if (BUILTIN_DICTIONARY[t]) {
+    const m = BUILTIN_DICTIONARY[t].name.match(/^(.*?)\s*\(/);
+    return (m ? m[1] : BUILTIN_DICTIONARY[t].name).toLowerCase();
+  }
+  const c = customAtoms.find(a => a.type === t);
+  return c ? c.name : t;
+}
+function probabilityWord(cases: number): string {
+  if (cases <= 1) return 'every single time';
+  const pct = 100 / cases;
+  if (pct >= 50) return `very often (~${pct.toFixed(0)}% per encounter)`;
+  if (pct >= 10) return `often (~${pct.toFixed(0)}% per encounter)`;
+  if (pct >= 1)  return `occasionally (~${pct.toFixed(0)}% per encounter)`;
+  if (pct >= 0.1) return `rarely (~${pct.toFixed(2)}% per encounter)`;
+  return `extremely rarely (~${pct.toFixed(3)}% per encounter)`;
+}
+function describeStateChange(t: string, before: number, after: number): string | null {
+  if (before === after) return null;
+  return `the ${atomShortName(t)} flips from state <strong>${before}</strong> to state <strong>${after}</strong>`;
+}
+function translateRule(rule: CustomRuleSpec): string {
+  const aShort = atomShortName(rule.aType);
+  const bShort = atomShortName(rule.bType);
+  const probability = probabilityWord(rule.cases);
+
+  const triggerParts: string[] = [];
+  triggerParts.push(`a <strong>${aShort}</strong> in state <strong>${rule.aState}</strong>`);
+  triggerParts.push(rule.currentAbBond ? `is BONDED to` : `is right next to`);
+  triggerParts.push(`a <strong>${bShort}</strong> in state <strong>${rule.bState}</strong>`);
+  let trigger = triggerParts.join(' ');
+
+  if (rule.nInputs === 3 && rule.cType) {
+    const cShort = atomShortName(rule.cType);
+    const bondNotes: string[] = [];
+    if (rule.currentAcBond) bondNotes.push('is bonded to the first');
+    if (rule.currentBcBond) bondNotes.push('is bonded to the second');
+    if (bondNotes.length === 0) bondNotes.push('is unbonded to either');
+    trigger += `, AND a <strong>${cShort}</strong> in state <strong>${rule.cState ?? 0}</strong> nearby (${bondNotes.join(' and ')})`;
+  }
+
+  const changes: string[] = [];
+  const aChange = describeStateChange(rule.aType, rule.aState, rule.futureAState);
+  if (aChange) changes.push(aChange);
+  const bChange = describeStateChange(rule.bType, rule.bState, rule.futureBState);
+  if (bChange) changes.push(bChange);
+  if (rule.currentAbBond !== rule.futureAbBond) {
+    changes.push(rule.futureAbBond ? `they FORM a new bond` : `their bond BREAKS`);
+  }
+  if (rule.nInputs === 3 && rule.cType) {
+    const cChange = describeStateChange(rule.cType, rule.cState ?? 0, rule.futureCState ?? 0);
+    if (cChange) changes.push(cChange);
+    if ((rule.currentBcBond ?? false) !== (rule.futureBcBond ?? false)) {
+      changes.push(rule.futureBcBond
+        ? `the second and third FORM a bond`
+        : `the second–third bond BREAKS`);
+    }
+    if ((rule.currentAcBond ?? false) !== (rule.futureAcBond ?? false)) {
+      changes.push(rule.futureAcBond
+        ? `the first and third FORM a bond`
+        : `the first–third bond BREAKS`);
+    }
+  }
+
+  if (changes.length === 0) {
+    return `Whenever ${trigger}, ${probability}, <em>nothing actually changes</em>. (This rule is a no-op — review it.)`;
+  }
+  return `Whenever ${trigger}, ${probability}, ${changes.join(', and ')}.`;
+}
+
+function reactivitySummary(t: string): string {
+  // Aggregate how many custom rules reference this atom and roughly what
+  // they do. Lets the dictionary entry say "X reacts with Y in 3 ways"
+  // without listing every rule individually.
+  const partners = new Set<string>();
+  let count = 0;
+  for (const r of customRules) {
+    const types = [r.aType, r.bType, r.cType].filter(x => x !== undefined) as string[];
+    if (types.includes(t)) {
+      count++;
+      for (const p of types) if (p !== t) partners.add(p);
+    }
+  }
+  if (count === 0) return `Currently inert — no custom rule references this atom yet.`;
+  const partnerList = Array.from(partners).map(p => atomShortName(p)).join(', ');
+  return `Participates in ${count} custom rule${count === 1 ? '' : 's'} alongside: <strong>${partnerList || 'itself'}</strong>.`;
+}
+
+function rebuildDictionary(): void {
+  const list = document.getElementById('dictionary-list');
+  if (!list) return;
+  list.innerHTML = '';
+
+  // Built-in atoms first, in chemistry-defined order.
+  const order = ['a', 'b', 'c', 'd', 'e', 'f', 'w', 'p'];
+  for (const t of order) {
+    const entry = BUILTIN_DICTIONARY[t];
+    if (!entry) continue;
+    list.appendChild(buildDictEntry(t, entry.name, entry.color, 'builtin', entry.description));
+  }
+
+  // Custom atoms — auto-generated descriptions from their rules.
+  for (const a of customAtoms) {
+    const ruleLines = customRules
+      .filter(r => r.aType === a.type || r.bType === a.type || r.cType === a.type)
+      .map(translateRule);
+    const summary = reactivitySummary(a.type);
+    const description = `${a.name} — a user-defined atom. Symbol: <strong>${a.type}</strong>. Default state: <strong>${a.defaultState}</strong>. ${summary}`;
+    list.appendChild(buildDictEntry(a.type, a.name, a.color, 'custom', description, ruleLines));
+  }
+
+  if (customAtoms.length === 0) {
+    const tip = document.createElement('div');
+    tip.className = 'lab-section-hint';
+    tip.style.marginTop = '14px';
+    tip.textContent = 'Add custom atoms in the Editor tab — they\'ll appear here with auto-generated rule explanations.';
+    list.appendChild(tip);
+  }
+}
+
+function buildDictEntry(symbol: string, name: string, color: string, kind: 'builtin' | 'custom', description: string, customRuleDescriptions: string[] = []): HTMLDivElement {
+  const entry = document.createElement('div');
+  entry.className = 'dict-entry';
+
+  const icon = document.createElement('div');
+  icon.className = 'dict-icon';
+  icon.style.background = color;
+  icon.textContent = symbol;
+
+  const meta = document.createElement('div');
+  meta.className = 'dict-meta';
+
+  const nameRow = document.createElement('div');
+  nameRow.className = 'dict-name';
+  nameRow.textContent = name;
+  const tag = document.createElement('span');
+  tag.className = `dict-tag ${kind}`;
+  tag.textContent = kind === 'builtin' ? 'Built-in' : 'Custom';
+  nameRow.appendChild(tag);
+
+  const desc = document.createElement('div');
+  desc.className = 'dict-desc';
+  desc.innerHTML = description;
+
+  meta.append(nameRow, desc);
+
+  // For custom atoms only, inline the translated rule list. Built-in
+  // descriptions are already complete prose so they don't need this block.
+  if (kind === 'custom') {
+    const rulesBlock = document.createElement('div');
+    rulesBlock.className = 'dict-rules';
+    const rulesTitle = document.createElement('div');
+    rulesTitle.className = 'dict-rules-title';
+    rulesTitle.textContent = `Rules involving ${symbol}`;
+    rulesBlock.appendChild(rulesTitle);
+    if (customRuleDescriptions.length === 0) {
+      const none = document.createElement('div');
+      none.className = 'dict-rule';
+      none.innerHTML = '<span class="none">No rules reference this atom yet — it will sit inert in the sim until you write one.</span>';
+      rulesBlock.appendChild(none);
+    } else {
+      for (const line of customRuleDescriptions) {
+        const r = document.createElement('div');
+        r.className = 'dict-rule';
+        r.innerHTML = line;
+        rulesBlock.appendChild(r);
+      }
+    }
+    meta.appendChild(rulesBlock);
+  }
+
+  entry.append(icon, meta);
+  return entry;
+}
+
 // Initial push so the worker has the persisted custom chemistry from disk.
 // Deferred via setTimeout so the worker has finished init() first; the
 // worker itself ignores the message until then anyway, but this avoids
