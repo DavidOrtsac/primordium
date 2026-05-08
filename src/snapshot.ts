@@ -68,6 +68,7 @@ export type ControlMsg =
   | { type: 'editAddAtom'; x: number; y: number; atomType: string; state: number }
   | { type: 'editDeleteAtom'; atomId: number }
   | { type: 'editToggleBond'; atomIdA: number; atomIdB: number }
+  | { type: 'replaceAtomType'; fromType: string; toType: string }
   | { type: 'setNoise'; enabled: boolean; copyFidelity: number; decayRate: number; bondFailRate: number }
   | { type: 'setHydrolysis'; enabled: boolean; baseRate: number; waterDensity: number }
   | { type: 'requestEventLog' }

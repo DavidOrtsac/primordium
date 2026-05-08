@@ -920,6 +920,24 @@
       color: rgba(255, 220, 60, 0.85);
       flex: 1 1 100%;
     }
+    .inspector-replace {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 12px;
+      background: rgba(245, 220, 80, 0.06);
+      border: 1px solid rgba(245, 220, 80, 0.22);
+      border-radius: 6px;
+    }
+    .replace-select {
+      padding: 4px 6px;
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      color: rgba(255, 255, 255, 0.92);
+      border-radius: 4px;
+      font-family: ui-monospace, "SF Mono", monospace;
+      font-size: 0.86rem;
+    }
     .inspector-hint {
       font-size: 0.78rem;
       color: rgba(255, 255, 255, 0.55);
@@ -1231,6 +1249,16 @@
                 <span class="editor-hint" id="editor-status">Click empty space in the canvas to drop an atom.</span>
               </div>
             </div>
+            <div class="inspector-replace">
+              <div class="editor-row">
+                <span class="editor-label">Replace</span>
+                <select id="replace-from" class="replace-select"></select>
+                <span class="editor-label" style="min-width:0">→</span>
+                <select id="replace-to" class="replace-select"></select>
+                <button id="replace-apply">Apply</button>
+              </div>
+              <div class="editor-hint" id="replace-status">Affects every atom in the entire sim of the source type.</div>
+            </div>
             <div class="inspector-hint">
               <strong>Compare across runs:</strong> save selections to JSON, reload them in a future sim, paste with <kbd>📥 Paste</kbd> in the panel — atoms drop at view center, bonds preserved. Edits inside the inspector apply to the live sim too.
             </div>
@@ -1322,9 +1350,9 @@
       </div>
     </div>
 
-    <!-- MUTATION LAB — noise sources -->
+    <!-- LAB — mutation, decomposition, inspector & JSON, all in one bench -->
     <div class="card card--mutation">
-      <div class="card__label">Mutation Lab</div>
+      <div class="card__label">🧪 Lab</div>
       <div class="card__row">
         <button id="noise-btn">🧬 Noise: OFF<span class="kbd-badge">N</span></button>
       </div>
@@ -1342,12 +1370,7 @@
           <span class="val" id="noise-bond-val">0</span>
         </label>
       </span>
-    </div>
-
-    <!-- DECOMPOSITION — water-driven hydrolysis -->
-    <div class="card card--hydro">
-      <div class="card__label">Decomposition</div>
-      <div class="card__row">
+      <div class="card__row" style="margin-top: 8px;">
         <button id="hydro-btn">💧🧪 Hydrolysis: OFF<span class="kbd-badge">H</span></button>
       </div>
       <span class="inline-sliders" id="hydro-sliders">
@@ -1360,15 +1383,8 @@
           <span class="val" id="hydro-density-val">0.0010</span>
         </label>
       </span>
-    </div>
-
-    <!-- INSPECTOR — selection studio (deep dive on whatever you've selected) -->
-    <div class="card card--inspector">
-      <div class="card__label">🔬 Inspector</div>
-      <div class="card__row">
-        <button id="inspect-btn">Open inspector<span class="kbd-badge">I</span></button>
-      </div>
-      <div class="card__row">
+      <div class="card__row" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08);">
+        <button id="inspect-btn">🔬 Open inspector<span class="kbd-badge">I</span></button>
         <button id="paste-btn">📥 Paste from JSON</button>
       </div>
       <div class="card__row">
