@@ -7,12 +7,16 @@
 
 import { RADIUS } from './cell';
 import { STRIDE, unpackType, unpackState } from './snapshot';
+import { DART_ATOMS } from './dart';
+import {
+  ATOM_COLORS, FALLBACK_COLOR, MEMBRANE_LINE, PREDATOR_LINE, PLAYER_LINE,
+  PREDATOR_UNIT, ALPHA, MARGIN, rgbHex, alphaHex, rgba,
+} from './theme';
 
 // ── Visual constants ────────────────────────────────────────────────────────
-const COLORS: Record<string, string> = {
-  e: '#ff3333', f: '#33ff33', b: '#888888', c: '#00dddd',
-  d: '#3366ff', p: '#ff7700', w: '#66ccff',
-};
+// All atom colors/alphas live in theme.ts — edit them there.
+const COLORS: Record<string, string> = {};
+for (const [type, rgb] of Object.entries(ATOM_COLORS)) COLORS[type] = rgbHex(rgb);
 // Lab additions land here too so the educational 2D fallback colors
 // custom atoms the same way as the GPU path.
 export function setEducationalAtomColor(type: string, hex: string): void {
@@ -20,15 +24,16 @@ export function setEducationalAtomColor(type: string, hex: string): void {
   if (reserved.has(type)) return;
   COLORS[type] = hex;
 }
+const FALLBACK_HEX = rgbHex(FALLBACK_COLOR);
 
 const LEGEND: { color: string; label: string; isLine?: boolean }[] = [
-  { color: '#c8a800', label: 'a  membrane (bond line)', isLine: true },
-  { color: '#888888', label: 'b  genome base' },
-  { color: '#00dddd', label: 'c  genome base' },
-  { color: '#3366ff', label: 'd  enzyme (mid-walk = bouncing)' },
-  { color: '#ff3333', label: 'e  genome start' },
-  { color: '#33ff33', label: 'f  genome end' },
-  { color: '#ff7700', label: 'p  lysin (dissolves membranes)' },
+  { color: COLORS.a, label: 'a  membrane unit' },
+  { color: COLORS.b, label: 'b  genome base' },
+  { color: COLORS.c, label: 'c  genome base' },
+  { color: COLORS.d, label: 'd  enzyme (mid-walk = bouncing)' },
+  { color: COLORS.e, label: 'e  genome start' },
+  { color: COLORS.f, label: 'f  genome end' },
+  { color: COLORS.p, label: 'p  lysin (dissolves membranes)' },
 ];
 
 const Q_STATE = 42;
@@ -248,6 +253,8 @@ export function draw2D(
   bacteriaView: boolean,
   epoch: number,
   camera: Camera,
+  gridW: number,
+  gridH: number,
 ): void {
   ensureDisplay(atomCount, epoch);
   smoothPositions(atoms, atomCount);
@@ -269,13 +276,20 @@ export function draw2D(
     grad.addColorStop(1,   '#b8b8b8');
     ctx.fillStyle = grad;
   } else {
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = rgbHex(MARGIN);
   }
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   // World→screen transform: screen_xy = (world_xy - camera) * zoom
   const z = camera.zoom;
   ctx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+
+  // The arena interior stays white — the margin outside the grid keeps
+  // the gray base fill from above.
+  if (!bacteriaView) {
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, gridW, gridH);
+  }
 
   // ── Water droplets — drawn first so atoms render ON TOP of water ────────
   const dropCount = droplets[0] | 0;
@@ -368,7 +382,7 @@ export function draw2D(
     for (let i = 0; i < atomCount; i++) {
       const o = i * STRIDE;
       const flags = atoms[o + 3] | 0;
-      const isMembrane = (flags & 4) !== 0;
+      const isMembrane = (flags & 4) !== 0 && (flags & 1) !== 0;
       const state = unpackState(atoms[o + 2]);
       if (state !== 0 || isMembrane) continue;
       const h = atomHash32(i, unpackType(atoms[o + 2]), state);
@@ -387,7 +401,7 @@ export function draw2D(
     for (let i = 0; i < atomCount; i++) {
       const o = i * STRIDE;
       const flags = atoms[o + 3] | 0;
-      const isMembrane = (flags & 4) !== 0;
+      const isMembrane = (flags & 4) !== 0 && (flags & 1) !== 0;
       const state = unpackState(atoms[o + 2]);
       if (state !== 0 || isMembrane) continue;
       const h = atomHash32(i, unpackType(atoms[o + 2]), state);
@@ -404,15 +418,20 @@ export function draw2D(
     for (let i = 0; i < atomCount; i++) {
       const o = i * STRIDE;
       const flags = atoms[o + 3] | 0;
-      const isMembrane = (flags & 4) !== 0;
+      // A membrane unit is a *bonded* 'a' — flag 4 alone marks every 'a',
+      // free ones included; they belong to the soup pass (ALPHA.aFree).
+      const isMembrane = (flags & 4) !== 0 && (flags & 1) !== 0;
       const state = unpackState(atoms[o + 2]);
       const type = String.fromCharCode(unpackType(atoms[o + 2]));
       // Water always renders via soup style regardless of state (fresh
       // and spent water are the same molecule visually).
       const isWater = type === 'w';
       if ((state !== 0 && !isWater) || isMembrane) continue;
-      const alpha = type === 'p' ? '55' : '1a';
-      const key = (COLORS[type] ?? '#ff3333') + alpha;
+      // ALPHA.soupLysin / ALPHA.aFree / ALPHA.soup — tuned in theme.ts
+      const alpha = alphaHex(type === 'p' ? ALPHA.soupLysin
+                                          : type === 'a' ? ALPHA.aFree
+                                          : ALPHA.soup);
+      const key = (COLORS[type] ?? FALLBACK_HEX) + alpha;
       let arr = buckets.get(key);
       if (!arr) { arr = []; buckets.set(key, arr); }
       arr.push(i);
@@ -428,6 +447,21 @@ export function draw2D(
       ctx.fill();
     }
   }
+
+  // ── Dart tracers — propelled lysin atoms (flag bit5) glow bright gold
+  // with a white rim so the player's shots read clearly mid-flight ────
+  ctx.fillStyle = 'rgba(255, 200, 60, 0.95)';
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (let i = 0; i < atomCount; i++) {
+    if (!((atoms[i * STRIDE + 3] | 0) & 32)) continue;
+    const px = _displayX[i] * scale, py = _displayY[i] * scale;
+    ctx.moveTo(px + r * 1.3, py);
+    ctx.arc(px, py, r * 1.3, 0, Math.PI * 2);
+  }
+  ctx.fill();
+  ctx.stroke();
 
   // ── Build inLoop bit-vector so we don't redraw closed-loop membrane bonds ─
   const inLoop = new Uint8Array(atomCount);
@@ -465,9 +499,9 @@ export function draw2D(
     ctx.lineWidth = 2.5;
     for (const { vert, n, kind } of loopOffsets) {
       smoothLoopFromIndices(loops, vert, n, loopSmoothing, _ptsA);
-      ctx.strokeStyle = kind === 1 ? 'rgba(200, 30, 0, 0.92)'
-                       : kind === 2 ? 'rgba(50, 220, 160, 0.95)'
-                       :              'rgba(200, 168, 0, 0.92)';
+      ctx.strokeStyle = kind === 1 ? rgba(PREDATOR_LINE, 0.92)
+                       : kind === 2 ? rgba(PLAYER_LINE, 0.95)
+                       :              rgba(MEMBRANE_LINE, 0.92);
       ctx.beginPath();
       tracePath(ctx, _ptsA, n, scale);
       ctx.stroke();
@@ -478,7 +512,7 @@ export function draw2D(
   const bondCount = bonds[0];
 
   // Prey open membrane chains
-  ctx.strokeStyle = bacteriaView ? 'rgba(50, 40, 30, 0.78)' : 'rgba(200, 168, 0, 0.92)';
+  ctx.strokeStyle = bacteriaView ? 'rgba(50, 40, 30, 0.78)' : rgba(MEMBRANE_LINE, 0.92);
   ctx.lineWidth = bacteriaView ? 1.0 : 2.5;
   ctx.beginPath();
   for (let bi = 0; bi < bondCount; bi++) {
@@ -495,7 +529,7 @@ export function draw2D(
   ctx.stroke();
 
   // Predator open membrane chains
-  ctx.strokeStyle = bacteriaView ? 'rgba(60, 25, 20, 0.85)' : 'rgba(200, 30, 0, 0.92)';
+  ctx.strokeStyle = bacteriaView ? 'rgba(60, 25, 20, 0.85)' : rgba(PREDATOR_LINE, 0.92);
   ctx.beginPath();
   for (let bi = 0; bi < bondCount; bi++) {
     const ai = bonds[1 + bi * 2];
@@ -525,6 +559,34 @@ export function draw2D(
       ctx.lineTo(_displayX[bj] * scale, _displayY[bj] * scale);
     }
     ctx.stroke();
+  }
+
+  // Membrane 'a' atoms as full-size translucent circles sitting under the
+  // bond lines — each unit is identifiable without turning the membrane
+  // into a string of saturated beads. Closed-loop units stay faint (20 %),
+  // open membrane chains are more visible (60 %) — loose building material
+  // should read stronger than a finished wall. Predators get pale red.
+  if (!bacteriaView) {
+    const dotBuckets = new Map<string, number[]>();
+    for (let i = 0; i < atomCount; i++) {
+      const flags = atoms[i * STRIDE + 3] | 0;
+      if (!(flags & 4) || !(flags & 1)) continue; // bonded 'a' units only
+      const key = rgba((flags & 2) !== 0 ? PREDATOR_UNIT : ATOM_COLORS.a,
+                       inLoop[i] ? ALPHA.aInLoop : ALPHA.aInChain);
+      let arr = dotBuckets.get(key);
+      if (!arr) { arr = []; dotBuckets.set(key, arr); }
+      arr.push(i);
+    }
+    for (const [color, indices] of dotBuckets) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      for (const i of indices) {
+        const px = _displayX[i] * scale, py = _displayY[i] * scale;
+        ctx.moveTo(px + r, py);
+        ctx.arc(px, py, r, 0, Math.PI * 2);
+      }
+      ctx.fill();
+    }
   }
 
   // ── Active non-membrane atoms (organelles/colored particles) ──────────────
@@ -562,7 +624,7 @@ export function draw2D(
       // (spent water). Skip them here so they don't get bumped into the
       // large saturated organelle visual.
       if (state === 0 || isMembrane || type === 'w') continue;
-      const key = (COLORS[type] ?? '#ff3333') + 'cc';
+      const key = (COLORS[type] ?? FALLBACK_HEX) + alphaHex(ALPHA.organelle);
       let arr = buckets.get(key);
       if (!arr) { arr = []; buckets.set(key, arr); }
       arr.push(i);
@@ -616,17 +678,23 @@ export function draw2DClassic(
   bonds: Uint32Array,
   droplets: Float32Array,
   camera: Camera,
+  gridW: number,
+  gridH: number,
 ): void {
   const { canvas } = ctx;
 
-  // Opaque white background covers whatever the main canvas had.
+  // Opaque background covers whatever the main canvas had — gray outside
+  // the arena bounds, white inside (same convention as draw2D).
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = '#ffffff';
+  ctx.fillStyle = rgbHex(MARGIN);
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   // World→screen camera transform, same convention as draw2D.
   const z = camera.zoom;
   ctx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, gridW, gridH);
 
   // Faint water droplet hint — Primordium-only feature, kept very subtle so
   // the classic look stays close to Hutton's. Set to 0 alpha if you want
@@ -726,23 +794,37 @@ export function drawArenaBorder(
   ctx.restore();
 }
 
-export function drawHUD2D(ctx: CanvasRenderingContext2D, iterations: number, atomCount: number, atoms: Float32Array): void {
-  let bonded = 0;
-  for (let i = 0; i < atomCount; i++) {
-    if ((atoms[i * STRIDE + 3] | 0) & 1) bonded++;
-  }
-  ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  ctx.fillRect(6, 6, 220, 42);
-  ctx.fillStyle = '#ffffff';
-  ctx.font = '12px monospace';
-  ctx.fillText(`iter:   ${iterations.toLocaleString()}`, 14, 22);
-  ctx.fillText(`bonded: ${bonded}   free: ${atomCount - bonded}`, 14, 38);
+// Stats HUD box geometry in canvas-internal px — shared with main.ts,
+// which docks the ‹/› HTML toggle button inside the box's top-right
+// corner while the HUD is visible. drawHUD2D keeps .w in sync with the
+// measured text width each frame.
+export const HUD_STATS_RECT = { x: 6, y: 6, w: 240, h: 42 };
+const HUD_LEGEND_W = 240;
 
-  const PAD = 10, SZ = 10, ROW = 18, W = 240;
-  const H = PAD * 2 + LEGEND.length * ROW - 2;
-  const lx = 6, ly = 56;
+// X offset of the HUD text — the ‹/› toggle docks left-aligned inside
+// the box, so the text sits right of a reserved strip (26 CSS px
+// button + 8px inset), converted into canvas-internal px via the
+// display scale.
+function hudTextX(ctx: CanvasRenderingContext2D): number {
+  const s = ctx.canvas.clientWidth ? ctx.canvas.clientWidth / ctx.canvas.width : 1;
+  return HUD_STATS_RECT.x + 8 + 34 / s + 6;
+}
+
+// The box hugs its content: at most as wide as the legend, growing
+// past it only when the text itself needs the room.
+function drawHudBox(ctx: CanvasRenderingContext2D, textX: number, textW: number, h: number): void {
+  HUD_STATS_RECT.w = textX - HUD_STATS_RECT.x + textW + 8;
+  HUD_STATS_RECT.h = h;
   ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  ctx.fillRect(lx, ly, W, H);
+  ctx.fillRect(HUD_STATS_RECT.x, HUD_STATS_RECT.y, HUD_STATS_RECT.w, h);
+}
+
+function drawHudLegend(ctx: CanvasRenderingContext2D): void {
+  const PAD = 10, SZ = 10, ROW = 18;
+  const H = PAD * 2 + LEGEND.length * ROW - 2;
+  const lx = 6, ly = HUD_STATS_RECT.y + HUD_STATS_RECT.h + 8;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(lx, ly, HUD_LEGEND_W, H);
   ctx.font = '11px monospace';
   LEGEND.forEach(({ color, label, isLine }, i) => {
     const y = ly + PAD + i * ROW;
@@ -762,6 +844,130 @@ export function drawHUD2D(ctx: CanvasRenderingContext2D, iterations: number, ato
     ctx.fillStyle = '#dddddd';
     ctx.fillText(label, lx + PAD + SZ + 8, y + SZ - 1);
   });
+}
+
+export function drawHUD2D(ctx: CanvasRenderingContext2D, iterations: number, atomCount: number, atoms: Float32Array): void {
+  ctx.save();
+  let bonded = 0;
+  for (let i = 0; i < atomCount; i++) {
+    if ((atoms[i * STRIDE + 3] | 0) & 1) bonded++;
+  }
+  ctx.font = '12px monospace';
+  const line1 = `iter:   ${iterations.toLocaleString()}`;
+  const line2 = `bonded: ${bonded} free: ${atomCount - bonded}`;
+  const textX = hudTextX(ctx);
+  const textW = Math.max(ctx.measureText(line1).width, ctx.measureText(line2).width);
+  drawHudBox(ctx, textX, textW, 42);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(line1, textX, 22);
+  ctx.fillText(line2, textX, 38);
+  drawHudLegend(ctx);
+  ctx.restore();
+}
+
+// Game-mode HUD stats — mirrors the win/lose rules evaluated in the
+// worker (physics-worker.ts → packSnapshot): a membrane loop counts as
+// "alive" when both genome markers ('e' and 'f') stay bonded to it.
+export type GameHudStats = {
+  playerCells: number;   // alive player membrane loops (0 = dying)
+  enemyCells: number;    // alive enemy loops left to wipe out (0 = winning)
+  membraneFrac: number;  // sealed share of player membrane atoms, 0..1
+  winIters: number;      // iterations until victory (0 while enemies remain)
+  loseIters: number;     // iterations until death (0 while a player loop lives)
+  itersPerSec: number;   // current effective iteration rate from the worker
+  gameStatus: number;    // 0 playing, 1 won, 2 lost
+  fireIters: number;     // iterations until the lysin dart can fire (0 = ready)
+  dartCount: number;     // dart atoms still under thrust
+  ammo: number;          // lysin atoms banked for darts (5 per shot)
+  homingOn: boolean;     // terminal guidance earned (first confirmed hit)
+  damageFlash: number;   // 0..1 — intensity of the just-bitten screen flash
+};
+
+const HUD_GOOD = '#5edca0';
+const HUD_WARN = '#e0b040';
+const HUD_BAD  = '#ff6464';
+
+export function drawGameHUD2D(ctx: CanvasRenderingContext2D, atoms: Float32Array, atomCount: number, stats: GameHudStats): void {
+  ctx.save();
+  let playerAtoms = 0;
+  for (let i = 0; i < atomCount; i++) {
+    // Atom flags bit3 = playerControlled (see packSnapshot in the worker).
+    if ((atoms[i * STRIDE + 3] | 0) & 8) playerAtoms++;
+  }
+  ctx.font = '12px monospace';
+  const line1 = `enemies: ${stats.enemyCells}`;
+  const line2 = `you:      ${playerAtoms} atoms`;
+  // Membrane bar — the danger indicator: torn-off membrane atoms keep the
+  // player flag outside the closed ring, so the sealed fraction drops as
+  // the cell is breached, well before the loop is gone entirely.
+  const frac = Math.max(0, Math.min(1, stats.membraneFrac));
+  const filled = Math.round(frac * 8);
+  const bar = '█'.repeat(filled) + '░'.repeat(8 - filled);
+  const membraneColor = stats.playerCells === 0 ? HUD_BAD
+    : frac >= 0.66 ? HUD_GOOD
+    : frac >= 0.33 ? HUD_WARN
+    : HUD_BAD;
+  const line3 = `membrane: ${bar} ${Math.round(frac * 100)}%`;
+  let status = 'wipe out every enemy';
+  let statusColor = '#ffffff';
+  if (stats.gameStatus === 1) {
+    status = 'victory!';
+    statusColor = HUD_GOOD;
+  } else if (stats.gameStatus === 2) {
+    status = 'dead';
+    statusColor = HUD_BAD;
+  } else if (stats.playerCells === 0) {
+    status = `membrane down — reseal in ${(stats.loseIters / Math.max(1, stats.itersPerSec)).toFixed(1)}s!`;
+    statusColor = HUD_BAD;
+  } else if (stats.winIters > 0) {
+    status = `victory in ${(stats.winIters / Math.max(1, stats.itersPerSec)).toFixed(1)}s`;
+    statusColor = HUD_GOOD;
+  }
+  // Lysovirus weapon state — reload countdown on line four, magazine
+  // and guidance on line five. 'unguided' marks shots that still fly
+  // straight: terminal guidance unlocks on the first confirmed hit.
+  const guide = stats.homingOn ? 'homing' : 'unguided';
+  const line4 = stats.ammo < DART_ATOMS ? 'lysovirus: no lysin'
+    : stats.fireIters > 0
+    ? `lysovirus: reload ${(stats.fireIters / Math.max(1, stats.itersPerSec)).toFixed(1)}s`
+    : 'lysovirus: READY';
+  const inFlight = stats.dartCount > 0
+    ? ` · ${Math.round(stats.dartCount / DART_ATOMS)} in flight` : '';
+  const line5 = `ammo ${stats.ammo} · ${guide}${inFlight}`;
+  const dartColor = stats.ammo < DART_ATOMS ? HUD_BAD
+    : stats.fireIters > 0 ? HUD_WARN : HUD_GOOD;
+  const textX = hudTextX(ctx);
+  const textW = Math.max(
+    ctx.measureText(line1).width,
+    ctx.measureText(line2).width,
+    ctx.measureText(line3).width,
+    ctx.measureText(line4).width,
+    ctx.measureText(line5).width,
+    ctx.measureText(status).width);
+  drawHudBox(ctx, textX, textW, 106);
+  const ty = HUD_STATS_RECT.y + 16;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(line1, textX, ty);
+  ctx.fillText(line2, textX, ty + 16);
+  ctx.fillStyle = membraneColor;
+  ctx.fillText(line3, textX, ty + 32);
+  ctx.fillStyle = dartColor;
+  ctx.fillText(line4, textX, ty + 48);
+  ctx.fillText(line5, textX, ty + 64);
+  ctx.fillStyle = statusColor;
+  ctx.fillText(status, textX, ty + 80);
+  // Damage flash — a decaying red vignette on every enemy bite.
+  if (stats.damageFlash > 0) {
+    const w = ctx.canvas.width, h = ctx.canvas.height;
+    const g = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.max(w, h) * 0.75);
+    g.addColorStop(0, 'rgba(255,60,60,0)');
+    g.addColorStop(1, `rgba(255,60,60,${(0.45 * stats.damageFlash).toFixed(3)})`);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+  }
+  // The sandbox legend is replaced in game mode by the fire pad
+  // (#fire-pad DOM element), so no drawHudLegend() call here.
+  ctx.restore();
 }
 
 // silence unused-warning for Q_STATE in case lint complains

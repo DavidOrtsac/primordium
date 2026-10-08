@@ -1,0 +1,11 @@
+{
+  "cookies": [],
+  "origins": [
+    {
+      "origin": "http://localhost:9131",
+      "localStorage": [
+        { "name": "evoloom-intro-v1", "value": "1" }
+      ]
+    }
+  ]
+}

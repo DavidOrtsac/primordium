@@ -1,4 +1,11 @@
 node_modules/
 dist/
+www/
 .DS_Store
 *.log
+
+# Playwright test workspace
+dev/playwright/node_modules/
+dev/playwright/test-results/
+dev/savegames/
+dev/deploy.sh

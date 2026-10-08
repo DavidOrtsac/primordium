@@ -8,7 +8,9 @@
 //   [0] x
 //   [1] y
 //   [2] packed: (typeCharCode << 16) | state    (read as f32 bit-pattern? — no, store as-is)
-//   [3] flags: bit0 = bonded, bit1 = predator-membrane (state>=Q && type=='a')
+//   [3] flags: bit0 = bonded, bit1 = predator-membrane (state>=Q && type=='a'),
+//        bit2 = 'a' atom, bit3 = playerControlled, bit4 = selected,
+//        bit5 = propelled dart atom (lysin shot still under thrust)
 //
 // We store packed data as Float32 by reinterpreting bits via a helper view —
 // see encodePack/decodePack below.
@@ -34,12 +36,31 @@ export type SnapshotMsg = {
   enemyCount:  number;       // # of full enemy loops on screen this snapshot
   playerCount: number;       // # of full player loops
   winCountdownIter: number;  // iterations remaining before win is awarded (0 if not currently winning)
+  loseCountdownIter: number; // iterations remaining before death is declared (0 while a live player loop exists)
+  playerMembraneFrac: number; // share of player 'a' atoms sealed in a closed loop (1 = intact, drops on breach)
+  itersPerSec: number;        // current effective iterations/s (varies with adaptive pacing and the speed slider)
+  fireCooldownIter: number;   // iterations until the lysin dart can fire again (0 = ready)
+  fireCooldownFrac: number;   // 0..1 fraction of cooldown remaining (1 = just fired)
+  projectileCount: number;    // dart atoms still under thrust this snapshot
+  lysinAmmo: number;          // lysin atoms banked for darts (DART_ATOMS per shot)
+  homingOn: boolean;          // terminal guidance earned — true after the first confirmed dart hit
+  enemyDirX: number;          // unit vector player → nearest enemy membrane atom (0,0 when none)
+  enemyDirY: number;
+  enemyDist: number;          // distance to that atom (0 when no enemy membrane exists)
+  lysinDirX: number;          // unit vector player → nearest free lysin atom (0,0 when none)
+  lysinDirY: number;
+  lysinDist: number;          // distance to it (0 when no free lysin exists)
 };
+
+// Lysin atoms banked at match start — shared by the worker (authoritative
+// magazine) and the main thread (seed value for the mirrored count).
+export const DART_AMMO_START = 15;
 
 export type ControlMsg =
   | { type: 'init'; gridW: number; gridH: number; mode: 'rigged' | 'wild' }
   | { type: 'pause'; paused: boolean }
   | { type: 'setStepsPerFrame'; n: number }
+  | { type: 'setSimRate'; v: number }
   | { type: 'setThermalScale'; v: number }
   | { type: 'setBondedDamping'; v: number }
   | { type: 'toggleLysin'; on: boolean }
@@ -53,6 +74,7 @@ export type ControlMsg =
   | { type: 'startGame' }
   | { type: 'endGame' }
   | { type: 'setPlayerInput'; x: number; y: number }
+  | { type: 'fire'; x: number; y: number }
   | { type: 'setDripFeed'; on: boolean; soupInterval: number; waterInterval: number }
   | { type: 'burn'; targetIters: number }
   | { type: 'abortBurn' }
@@ -212,6 +234,19 @@ export type BurnDoneMsg = {
   iterations: number;
   aborted: boolean;
 };
+
+// Posted when a 'fire' control message is rejected — the UI can explain
+// why (a mirrored cooldown can lag a frame, so rejects need a channel
+// back rather than a client-side gate alone).
+export type FireRejectedMsg = {
+  type: 'fireRejected';
+  reason: 'ammo' | 'cooldown';
+};
+
+// One-shot game events the HUD should react to — enemy bites that
+// breached the player's membrane and dart detonations on a target.
+export type PlayerHitMsg = { type: 'playerHit' };
+export type DartHitMsg   = { type: 'dartHit' };
 
 // Chunk of noise events drained from the worker's ring buffer. Six
 // parallel Uint32Arrays keep wire format compact and transferable.

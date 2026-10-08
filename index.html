@@ -7,6 +7,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="theme-color" content="#0a0a0a" />
   <title>Primordium</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23d4a64f' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%23d4a64f'/%3E%3C/svg%3E">
   <style>
     /* ──────────────────────────────────────────────────────────────────────
        PRIMORDIUM — design system
@@ -170,7 +171,10 @@
       position: relative;
       display: inline-block;
       line-height: 0;
-      overflow: hidden;
+      /* overflow:clip forbids scrolling entirely — scroll containers
+         auto-scroll focused descendants into view, which would drag the
+         canvas view sideways whenever a control-panel button is pressed */
+      overflow: clip;
       box-shadow:
         0 0 0 1px var(--border-subtle),
         0 20px 60px -20px rgba(212, 166, 79, 0.10),
@@ -221,6 +225,24 @@
       background: rgba(20, 20, 22, 0.78);
       border-color: var(--border-emph);
       color: var(--text-bright);
+    }
+    /* HUD hide/show arrow — top-left corner, toggles the stats/legend
+       block drawn on the overlay canvas. */
+    .hud-toggle {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      width: 26px;
+      height: 26px;
+      font-size: 0.75rem;
+      z-index: 12;
+    }
+    /* Docked inside the dark stats box, the dark translucent face would
+       blend to near-black — this matches the perceived medium-gray the
+       button has when floating over the bright canvas. */
+    .hud-toggle.docked {
+      background: rgba(145, 145, 145, 0.55);
+      border-color: rgba(255, 255, 255, 0.18);
     }
     /* Active state for the menu toggle when panel is open: subtle gold tint */
     .canvas-tool-btn.active {
@@ -274,8 +296,7 @@
       border-color: rgba(212, 166, 79, 0.45);
       color: var(--c-primary);
     }
-    /* Backwards-compat — anywhere old .fs-toggle CSS is referenced */
-    .fs-toggle { /* deprecated, retained for safety */ }
+
 
     /* Microscope vignette */
     .scope-frame::after {
@@ -295,6 +316,186 @@
     }
     .scope-frame.microscope::after { opacity: 1; }
 
+    /* Lysovirus fire pad + steering ring — game-mode replacement for the
+       legend block. The wrap positions both zones: the inner pad fires
+       (press offset = launch direction), the outer ring steers the cell
+       while held (direction from center = swim direction) — everything
+       the match needs in one spot. */
+    #fire-wrap {
+      position: absolute;
+      top: 124px;         /* below the game stats box on the overlay canvas */
+      left: 4px;
+      width: 285px;
+      height: 285px;
+      z-index: 12;
+      display: none;
+      pointer-events: none;
+    }
+    #fire-wrap.shown { display: block; }
+    /* Steering ring — a recessed groove around the pad that a marble
+       rolls in while steering (the grip). clip-path keeps pointer hits
+       inside the circle so the square corners stay dead; the band only
+       spans the annulus (≈80–100% of the wrap radius) so the fire pad
+       keeps its own look. */
+    #steer-ring {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      clip-path: circle(50%);
+      background: radial-gradient(circle,
+        transparent 78%,
+        rgba(30, 40, 36, 0.22) 83%,
+        rgba(30, 40, 36, 0.30) 89%,
+        rgba(30, 40, 36, 0.20) 95%,
+        rgba(148, 220, 178, 0.08) 99%);
+      box-shadow:
+        inset 0 3px 10px rgba(0, 0, 0, 0.35),
+        inset 0 -2px 6px rgba(255, 255, 255, 0.07),
+        0 0 0 1px rgba(148, 220, 178, 0.16);
+      pointer-events: auto;
+      touch-action: none; /* ring presses must never scroll the page */
+      cursor: pointer;
+    }
+    #steer-ring.steering {
+      box-shadow:
+        inset 0 3px 10px rgba(0, 0, 0, 0.4),
+        inset 0 -2px 6px rgba(255, 255, 255, 0.10),
+        0 0 0 1px rgba(148, 220, 178, 0.45);
+    }
+    /* The marble — rolls along the groove toward the steering direction,
+       set via --bx/--by from setMoveGlow so every input source (ring,
+       WASD, canvas hold) moves it. Stays where it was left, like a
+       trackball resting in its channel. */
+    #ring-ball {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 34% 28%,
+        rgba(255, 255, 255, 0.55),
+        rgba(160, 228, 192, 0.45) 32%,
+        rgba(90, 150, 118, 0.42) 78%);
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3),
+                  inset 0 -2px 4px rgba(0, 0, 0, 0.15);
+      transform: translate(-50%, -50%) translate(var(--bx, 0px), var(--by, -128px));
+      transition: transform 0.07s linear;
+      pointer-events: none;
+    }
+    #fire-pad {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 229px;
+      height: 229px;
+      border-radius: 50%;
+      background: rgba(0, 0, 0, 0.55);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      pointer-events: auto; /* the wrap disables events; pad + ring re-enable */
+      touch-action: none;
+      cursor: crosshair;
+    }
+    /* Out of lysin — pad dims so the reload sweep can't be mistaken
+       for a ready weapon */
+    #fire-pad.empty { opacity: 0.35; }
+    /* Cooldown sweep — a conic wedge draining as the dart reloads.
+       --cd holds the remaining fraction 0..1, set from the render loop. */
+    #fire-pad::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background: conic-gradient(rgba(212, 166, 79, 0.5) calc(var(--cd, 0) * 1turn), transparent 0);
+      pointer-events: none;
+    }
+    /* Compass needle — bottom tip pinned to the pad center, rotated to
+       the last fired/aimed direction (0deg = straight up). */
+    #fire-needle {
+      position: absolute;
+      left: calc(50% - 3px);
+      top: calc(50% - 78px);
+      width: 6px;
+      height: 78px;
+      transform-origin: 50% 100%;
+      transform: rotate(0deg);
+      background: linear-gradient(to top, transparent, var(--c-primary, #d4a64f));
+      border-radius: 3px;
+      pointer-events: none;
+    }
+    /* Enemy bearing — a small red tick on the rim pointing at the
+       nearest enemy membrane (updated from each snapshot). Hidden when
+       no enemy exists. */
+    #fire-enemy {
+      position: absolute;
+      left: calc(50% - 3px);
+      top: 4px;
+      width: 6px;
+      height: 16px;
+      border-radius: 3px;
+      background: #ff5f5f;
+      box-shadow: 0 0 5px rgba(255, 95, 95, 0.8);
+      transform-origin: 50% 110.5px; /* pad center: half of the 229px pad minus the 4px top offset */
+      transform: rotate(0deg);
+      pointer-events: none;
+      display: none;
+    }
+    #fire-enemy.shown { display: block; }
+    /* Proximity warning — the tick blinks when the nearest enemy is
+       inside ~220 units (bite range is close behind). */
+    #fire-enemy.close { animation: enemy-pulse 0.45s ease-in-out infinite alternate; }
+    @keyframes enemy-pulse {
+      from { opacity: 0.25; }
+      to   { opacity: 1; }
+    }
+    /* Lysin bearing — amber dot on the rim pointing at the nearest
+       free lysin atom (supply spot or spent dart payload). */
+    #fire-lysin {
+      position: absolute;
+      left: calc(50% - 5px);
+      top: 8px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #f0a63c;
+      box-shadow: 0 0 5px rgba(240, 166, 60, 0.9);
+      transform-origin: 50% 106.5px; /* half the 229px pad minus the 8px top offset */
+      transform: rotate(0deg);
+      pointer-events: none;
+      display: none;
+    }
+    #fire-lysin.shown { display: block; }
+    /* Movement shimmer — a soft green wedge rotated to the live
+       steering input (WASD/arrows or canvas hold), so pressing a key
+       gives instant feedback before the cell visibly reacts. --mdeg
+       uses the needle convention (0deg = straight up). */
+    #fire-move {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background: conic-gradient(from -30deg,
+        transparent 0deg,
+        rgba(94, 220, 160, 0.5) 30deg,
+        transparent 60deg);
+      transform: rotate(var(--mdeg, 0deg));
+      pointer-events: none;
+      display: none;
+    }
+    #fire-pad.moving #fire-move { display: block; }
+    #fire-pad::after {
+      content: '';
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 10px;
+      height: 10px;
+      margin: -5px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.75);
+      pointer-events: none;
+    }
+
     /* ── Game overlay ──────────────────────────────────────────────────── */
     #game-overlay {
       position: absolute;
@@ -312,6 +513,9 @@
       text-align: center;
       border-radius: 6px;
     }
+    /* First-visit intro reuses this overlay as a real modal — the
+       canvas stays reachable behind the end-of-match variant. */
+    #game-overlay.blocking { pointer-events: auto; }
     #game-overlay-title {
       font-family: var(--font-sans);
       font-weight: 200;
@@ -325,6 +529,31 @@
       font-size: 0.95rem;
       color: var(--text-default);
       letter-spacing: 0.06em;
+    }
+    /* End-of-match actions — the overlay itself stays click-through;
+       only the buttons are interactive. */
+    #game-overlay-buttons {
+      display: flex;
+      gap: 14px;
+      pointer-events: auto;
+    }
+    #game-overlay-buttons button {
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+      padding: 10px 22px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      background: rgba(255, 255, 255, 0.08);
+      color: #fff;
+      cursor: pointer;
+      letter-spacing: 0.05em;
+    }
+    #game-overlay-buttons button:hover {
+      background: rgba(255, 255, 255, 0.18);
+    }
+    #game-overlay-buttons .primary {
+      border-color: var(--c-primary, #d4a64f);
+      color: var(--c-primary, #d4a64f);
     }
 
     /* ── Status line ──────────────────────────────────────────────────────
@@ -427,6 +656,7 @@
     .card.card--archive  .card__label { color: var(--c-archive); }
     .card.card--game     .card__label { color: var(--c-life); }
     .card.card--view     .card__label { color: var(--c-primary); }
+    .card.card--learn    .card__label { color: var(--c-hydrolysis); }
     .card.card--physics  .card__label { color: var(--c-primary); }
 
     .card__row {
@@ -788,14 +1018,23 @@
       display: none;
       align-items: center;
       justify-content: center;
-      background: rgba(8, 12, 22, 0.72);
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
-      z-index: 70;
       padding: 20px;
     }
     .inspector.shown { display: flex; }
+    /* The dim/blur layer is its own element so the tutorial overlay can
+       stack between it and the card — as a plain positioned child of a
+       context-free .inspector it competes in the global z-order. */
+    .inspector-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(8, 12, 22, 0.72);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      z-index: 60;
+    }
     .inspector-card {
+      position: relative;
+      z-index: 70;
       width: min(720px, 100%);
       max-height: 100%;
       background: rgba(15, 22, 36, 0.96);
@@ -1262,9 +1501,14 @@
          hamburger underneath the canvas is no longer needed. Hide it. */
       .ctl-toggle { display: none !important; }
 
-      /* Mobile panel: full-width, backdrop active */
+      /* Mobile panel: fixed to the viewport so it is fully visible even
+         when the canvas frame extends beyond the fold. */
       .control-panel {
-        width: 92vw;
+        position: fixed;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        width: min(92vw, 420px);
         max-width: none;
       }
       .control-panel-backdrop {
@@ -1276,25 +1520,37 @@
         gap: var(--gap-snug);
       }
       .hint-row { display: none; }
+      /* No physical keyboard on touch devices — hide every shortcut
+         hint: the badges on buttons and the shortcuts card. */
+      .kbd-badge, .card--shortcuts, #wasd-hint { display: none !important; }
+      /* Icon-only hamburger — the "Controls" word wastes space and the
+         glyph is universally understood. */
+      #menu-toggle .menu-label { display: none; }
+      /* Canvas chrome reduced to the hamburger: fullscreen and the
+         tutorial entry live inside the menu on touch layouts. */
+      #fs-toggle, #tutorial-btn { display: none; }
+      /* In pseudo-fullscreen the corner ⛶/✕ button is the only way back
+         — keep it visible even though it is hidden in the normal view. */
+      body.canvas-fullscreen #fs-toggle { display: inline-flex; }
       .inline-sliders { font-size: 0.72rem; }
       .inline-sliders input[type=range] { width: 100px; }
       #game-overlay-title { font-size: 1.7rem; }
       #game-overlay-sub   { font-size: 0.85rem; }
     }
     /* PORTRAIT mobile — canvas internal resolution is 800×1400. Display the
-       canvas with that aspect ratio and let it consume most of the vertical
-       viewport so the simulation is the dominant visual element. */
+       canvas with that aspect ratio at the full screen width; if it ends
+       up taller than the viewport the page scrolls — the sim stays the
+       dominant visual element. */
     @media (max-width: 900px) and (orientation: portrait),
            (pointer: coarse) and (orientation: portrait) {
+      body { padding-left: 0; padding-right: 0; }
+      .title-block { padding-left: 6px; padding-right: 6px; }
       canvas {
         aspect-ratio: 800 / 1400;
-        max-height: 78vh; /* leave room for status + ☰ Controls under the canvas */
-        width: auto !important;
+        width: 100% !important;
         height: auto !important;
       }
       .scope-frame {
-        display: flex;
-        justify-content: center;
         width: 100% !important;
       }
     }
@@ -1303,6 +1559,27 @@
            (pointer: coarse) and (orientation: landscape) {
       canvas {
         aspect-ratio: 1400 / 800;
+      }
+    }
+
+    /* ── FLUID CANVAS — the sim fills the window ─────────────────────
+       On landscape layouts the canvas always takes the full available
+       width and whatever height remains under the title/status chrome
+       (~165px desktop, ~130px mobile). The internal resolution tracks
+       the display box 1:1 (resizeCanvasToDisplay in main.ts), so a
+       resize reframes the arena instead of scrolling or distorting.
+       Portrait mobile keeps the fixed 800×1400 aspect; pseudo-
+       fullscreen sizes itself. */
+    @media (min-width: 901px) and (pointer: fine) {
+      body:not(.canvas-fullscreen) #canvas {
+        width: calc(100vw - 32px) !important;
+        height: max(100px, calc(100vh - 165px)) !important;
+      }
+    }
+    @media (max-width: 900px) and (orientation: landscape),
+           (pointer: coarse) and (orientation: landscape) {
+      body:not(.canvas-fullscreen) #canvas {
+        height: max(100px, calc(100vh - 130px)) !important;
       }
     }
 
@@ -1354,6 +1631,125 @@
       top: 12px;
       right: 12px;
     }
+
+    /* ──────────────────────────────────────────────────────────────────────
+       TUTORIAL — coach overlay. Pointer-transparent so the canvas stays
+       interactive during "try it" steps; the card itself catches clicks. */
+    #tutorial-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 400;
+      pointer-events: none;
+    }
+    #tutorial-spot {
+      position: fixed;
+      border: 2px solid var(--c-primary);
+      border-radius: 10px;
+      box-shadow: 0 0 0 9999px rgba(4, 6, 10, 0.55),
+                  0 0 24px rgba(212, 166, 79, 0.55);
+      transition: left 0.25s var(--ease), top 0.25s var(--ease),
+                  width 0.25s var(--ease), height 0.25s var(--ease);
+    }
+    #tutorial-card {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%);
+      width: min(520px, calc(100vw - 32px));
+      max-height: 45vh;
+      overflow-y: auto;
+      pointer-events: auto;
+      background: rgba(15, 22, 36, 0.78);
+      border: 1px solid rgba(212, 166, 79, 0.45);
+      border-radius: 12px;
+      box-shadow: 0 20px 60px -20px rgba(0, 0, 0, 0.7);
+      padding: 14px 16px;
+      line-height: 1.5;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+    .tutorial-step-label {
+      font-size: 0.7rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--c-primary);
+      margin-bottom: 2px;
+    }
+    .tutorial-title {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: var(--text-default);
+      margin-bottom: 6px;
+    }
+    .tutorial-body {
+      font-size: 0.88rem;
+      color: #ffffff;
+    }
+    .tutorial-body b { color: #ffffff; }
+    .tutorial-body code {
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 4px;
+      padding: 0 4px;
+      font-size: 0.85em;
+    }
+    .tutorial-body kbd {
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid var(--border-subtle);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      padding: 0 5px;
+      font-size: 0.82em;
+      font-family: inherit;
+    }
+    .tutorial-body a { color: var(--c-primary); }
+    .tutorial-nav {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .tutorial-dots {
+      flex: 1;
+      display: flex;
+      justify-content: center;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+    .tutorial-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.18);
+    }
+    .tutorial-dot.current { background: var(--c-primary); }
+    .tutorial-nav button {
+      min-height: 0;
+      padding: 6px 12px;
+      font-size: 0.82rem;
+      white-space: nowrap;
+    }
+    #tut-next {
+      background: rgba(212, 166, 79, 0.18);
+      border-color: var(--c-primary);
+      color: var(--c-primary);
+    }
+    #tut-next:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+    #tut-skip { opacity: 0.7; }
+    /* TASK lines inside a step body */
+    .tutorial-task {
+      display: inline-block;
+      margin: 4px 0;
+      padding: 4px 10px;
+      border-left: 3px solid var(--c-primary);
+      background: rgba(212, 166, 79, 0.10);
+      border-radius: 0 6px 6px 0;
+      color: var(--text-default);
+      font-weight: 600;
+    }
+    .tutorial-title.tutorial-done { color: var(--c-primary); }
   </style>
 </head>
 <body>
@@ -1371,15 +1767,22 @@
     <canvas id="canvas"></canvas>
     <canvas id="overlay"></canvas>
     <div class="canvas-tools">
-      <button id="menu-toggle" class="canvas-tool-btn canvas-tool-btn--menu" aria-label="Toggle controls panel" title="Controls (M)">
+      <button id="menu-toggle" class="canvas-tool-btn canvas-tool-btn--menu" aria-label="Toggle controls panel" title="Controls (M)" data-help="Open / close the controls panel">
         <span class="menu-icon">☰</span>
         <span class="menu-label">Controls</span>
       </button>
-      <button id="fs-toggle" class="canvas-tool-btn" aria-label="Toggle fullscreen" title="Fullscreen">⛶</button>
+      <button id="fs-toggle" class="canvas-tool-btn fs-toggle" aria-label="Toggle fullscreen" title="Fullscreen" data-help="Toggle fullscreen">⛶</button>
+      <button id="tutorial-btn" class="canvas-tool-btn" aria-label="Interactive tutorial" title="Interactive tutorial" data-help="Start the guided interactive tutorial">?</button>
     </div>
+    <button id="hud-toggle" class="canvas-tool-btn hud-toggle" aria-label="Toggle stats overlay" title="Hide / show stats overlay" data-help="Hide / show the stats &amp; legend overlay">‹</button>
+    <div id="fire-wrap"><div id="steer-ring" role="button" aria-label="Steer cell" title="Steering — hold anywhere on the green ring to swim toward it"><div id="ring-ball"></div></div><div id="fire-pad" role="button" aria-label="Fire lysovirus" title="Lysovirus — press toward a direction to fire · red tick = nearest enemy, amber dot = nearest lysin · green wedge = steering"><div id="fire-move"></div><div id="fire-needle"></div><div id="fire-enemy"></div><div id="fire-lysin"></div></div></div>
     <div id="game-overlay">
       <div id="game-overlay-title"></div>
       <div id="game-overlay-sub"></div>
+      <div id="game-overlay-buttons">
+        <button id="game-again" class="primary">↻ play again <kbd>↵</kbd></button>
+        <button id="game-exit">✕ sandbox</button>
+      </div>
     </div>
 
     <!-- Panel backdrop — only visible on mobile when panel is open.
@@ -1390,6 +1793,7 @@
     <!-- LAB MODAL — Path-B custom chemistry editor. User-defined atoms and
          reactions live here; built-in chemistry is never modified. -->
     <div id="lab-modal" class="inspector" aria-hidden="true">
+      <div class="inspector-backdrop"></div>
       <div class="inspector-card" style="width: min(820px, 100%);">
         <div class="inspector-header">
           <span class="inspector-title">⚗️ Custom Chemistry Editor</span>
@@ -1479,6 +1883,7 @@
          inside scope-frame so it overlays only the sim, not the page.
          Sim keeps running underneath; this is a read-only study tool. -->
     <div id="inspector" class="inspector" aria-hidden="true">
+      <div class="inspector-backdrop"></div>
       <div class="inspector-card">
         <div class="inspector-header">
           <span class="inspector-title">🔬 Selection Inspector</span>
@@ -1552,9 +1957,30 @@
     <div class="card card--view always-visible">
       <div class="card__label">View · Playback</div>
       <div class="card__row">
-        <button id="pause-btn">Pause<span class="kbd-badge">␣</span></button>
-        <button id="view-btn">View: Educational<span class="kbd-badge">V</span></button>
-        <button id="rec-btn">● REC<span class="kbd-badge">R</span></button>
+        <button id="pause-btn" data-help="Pause / resume the simulation">Pause<span class="kbd-badge">␣</span></button>
+        <button id="view-btn" data-help="Cycle view — educational · classic · microscope">View: Educational<span class="kbd-badge">V</span></button>
+        <button id="rec-btn" data-help="Record the canvas to a .webm video">● REC<span class="kbd-badge">R</span></button>
+      </div>
+      <div class="card__row">
+        <button id="fs-btn" data-help="Toggle fullscreen">⛶ Fullscreen</button>
+      </div>
+    </div>
+
+    <!-- LEARN — guided tour and the atom dictionary, the onboarding entry
+         points; the actual chemistry editor stays in the Lab card -->
+    <div class="card card--learn always-visible">
+      <div class="card__label">Learn</div>
+      <div class="card__row">
+        <button id="tutorial-btn2" data-help="Start the guided interactive tutorial">🎓 Tutorial</button>
+        <button id="dict-btn" data-help="Atom dictionary — every atom type &amp; what its states mean, in plain English">📖 Atom dictionary</button>
+      </div>
+    </div>
+
+    <!-- PLAY MODE — distinct alive-green card -->
+    <div class="card card--game always-visible">
+      <div class="card__label">Play Mode</div>
+      <div class="card__row">
+        <button id="game-btn" data-help="Play mode — steer your green microbe with WASD or arrow keys">🦠 Steer a microbe<span class="kbd-badge">G</span></button>
       </div>
     </div>
 
@@ -1562,13 +1988,14 @@
     <div class="card card--brushes always-visible">
       <div class="card__label">Brushes · Tools</div>
       <div class="card__row">
-        <button id="soup-brush-btn">🖌 Soup<span class="kbd-badge">B</span></button>
-        <button id="water-brush-btn">💧 Water<span class="kbd-badge">W</span></button>
-        <button id="clear-water-btn">Clear water<span class="kbd-badge">C</span></button>
+        <button id="soup-brush-btn" data-help="Soup brush — click &amp; drag to seed loose atoms">🖌 Soup: <span class="brush-state">OFF</span><span class="kbd-badge">B</span></button>
+        <button id="water-brush-btn" data-help="Water brush — click to drop water; droplets fuse">💧 Water: <span class="brush-state">OFF</span><span class="kbd-badge">W</span></button>
+        <button id="clear-water-btn" data-help="Remove all water droplets">Clear water<span class="kbd-badge">C</span></button>
+        <button id="lysin-btn" data-help="Seed lysin — dissolves membranes on contact">Lysin: OFF<span class="kbd-badge">P</span></button>
       </div>
       <div class="card__row">
-        <button id="select-btn">🎯 Select atom</button>
-        <button id="lysin-btn">Lysin: OFF<span class="kbd-badge">P</span></button>
+        <button id="select-btn" data-help="Select atoms — drag a box, click a single atom, Delete removes">🎯 Select: <span class="brush-state">OFF</span><span class="kbd-badge">S</span></button>
+        <button id="follow-btn" disabled data-help="Camera follows the selected atoms — panning releases">🎥 Follow: <span class="brush-state">OFF</span><span class="kbd-badge">F</span></button>
       </div>
     </div>
 
@@ -1576,7 +2003,7 @@
     <div class="card card--world">
       <div class="card__label">World · Replenishment</div>
       <div class="card__row">
-        <button id="drip-btn">💧 Drip: OFF</button>
+        <button id="drip-btn" data-help="Periodically respawn soup &amp; water into the sandbox">💧 Drip: OFF</button>
         <span class="inline-sliders" id="drip-sliders">
           <label>soup
             <input type="range" id="drip-soup-slider" min="100" max="3000" value="700" step="50">
@@ -1588,16 +2015,20 @@
           </label>
         </span>
       </div>
-      <div class="card__row">
+      <!-- Burn is hidden: at saturated atom counts the physics step
+           dominates so completely that skipping the per-tick snapshot
+           only gains a few percent — not worth a panel row. The burn
+           mechanism stays in the code; drop this class to re-enable. -->
+      <div class="card__row" style="display:none">
         <span class="ctl-label">⏩ Burn</span>
-        <input id="burn-iters" type="number" value="100000" min="1000" step="10000">
+        <input id="burn-iters" type="number" value="1000" min="0" step="100">
         <span class="ctl-label">iters</span>
-        <button id="burn-btn">Start</button>
+        <button id="burn-btn" data-help="Fast-forward the simulation without rendering">Start</button>
       </div>
       <div class="card__row">
         <span class="ctl-label">🎲 seed</span>
         <input id="seed-input" type="number" value="1" min="0" step="1">
-        <button id="seed-apply-btn">Reseed</button>
+        <button id="seed-apply-btn" data-help="Restart the world with this RNG seed">Reseed</button>
       </div>
     </div>
 
@@ -1605,15 +2036,15 @@
     <div class="card card--physics">
       <div class="card__label">Physics</div>
       <div class="card__row sliders">
-        <label>speed
-          <input type="range" id="speed-slider" min="1" max="30" value="8">
-          <span class="val" id="speed-val">8</span>
+        <label data-help="Speed — simulation rate, 100% = as fast as the CPU allows">speed
+          <input type="range" id="speed-slider" min="5" max="100" value="100" step="5">
+          <span class="val" id="speed-val">100%</span>
         </label>
-        <label>soup
+        <label data-help="Soup heat — Brownian jitter speed of free atoms; hotter soup = more collisions, faster chemistry, more wobble on membranes">soup
           <input type="range" id="soup-slider" min="0" max="100" value="60">
           <span class="val" id="soup-val">60%</span>
         </label>
-        <label>damp
+        <label data-help="Damping — share of jiggle bonded atoms keep each step; 1.00 = membranes stay elastic and flickery, low = stiff, settled cell walls">damp
           <input type="range" id="damp-slider" min="50" max="100" value="100">
           <span class="val" id="damp-val">1.00</span>
         </label>
@@ -1624,7 +2055,7 @@
     <div class="card card--mutation">
       <div class="card__label">🧪 Lab</div>
       <div class="card__row">
-        <button id="noise-btn">🧬 Noise: OFF<span class="kbd-badge">N</span></button>
+        <button id="noise-btn" data-help="Noise — imperfect copying, decay &amp; bond failures">🧬 Noise: OFF<span class="kbd-badge">N</span></button>
       </div>
       <span class="inline-sliders" id="noise-sliders">
         <label>copy
@@ -1641,7 +2072,7 @@
         </label>
       </span>
       <div class="card__row" style="margin-top: 8px;">
-        <button id="hydro-btn">💧🧪 Hydrolysis: OFF<span class="kbd-badge">H</span></button>
+        <button id="hydro-btn" data-help="Hydrolysis — water atoms in droplets slowly break bonds">💧🧪 Hydrolysis: OFF<span class="kbd-badge">H</span></button>
       </div>
       <span class="inline-sliders" id="hydro-sliders">
         <label>rate
@@ -1654,8 +2085,8 @@
         </label>
       </span>
       <div class="card__row" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08);">
-        <button id="inspect-btn">🔬 Open inspector<span class="kbd-badge">I</span></button>
-        <button id="paste-btn">📥 Paste from JSON</button>
+        <button id="inspect-btn" data-help="Open the inspector for the selected atoms">🔬 Open inspector<span class="kbd-badge">I</span></button>
+        <button id="paste-btn" data-help="Paste atoms from a JSON selection file">📥 Paste from JSON</button>
       </div>
       <div class="card__row">
         <span class="ctl-label" id="selection-count">No selection · use the Select brush, then click any atom</span>
@@ -1665,7 +2096,7 @@
            is never modified; user definitions are appended on top and
            cleared cleanly on every chemistry rebuild. -->
       <div class="card__row" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08);">
-        <button id="lab-open-btn">⚗️ Custom chemistry editor</button>
+        <button id="lab-open-btn" data-help="Define custom atoms &amp; reaction rules">⚗️ Custom chemistry editor</button>
       </div>
       <div class="card__row">
         <span class="ctl-label" id="custom-summary">0 custom atoms · 0 custom rules</span>
@@ -1676,31 +2107,23 @@
     <div class="card card--archive">
       <div class="card__label">Archive · Export</div>
       <div class="card__row">
-        <button id="save-btn">💾 Save</button>
-        <button id="load-btn">📂 Load</button>
+        <button id="save-btn" data-help="Download the full sim state as JSON">💾 Save</button>
+        <button id="load-btn" data-help="Load a saved sim state">📂 Load</button>
       </div>
       <div class="card__row">
-        <button id="reset-btn" class="danger">♻️ Reset simulation</button>
+        <button id="reset-btn" class="danger" data-help="Reset to a fresh arena">♻️ Reset simulation</button>
       </div>
       <div class="card__row">
         <span class="ctl-label">📊 stats</span>
-        <button id="csv-btn">CSV</button>
-        <button id="csv-clear-btn">Clear</button>
+        <button id="csv-btn" data-help="Export the stats log as CSV">CSV</button>
+        <button id="csv-clear-btn" data-help="Clear the stats log">Clear</button>
         <span id="csv-count" class="ctl-label">0 rows</span>
       </div>
       <div class="card__row">
         <span class="ctl-label">📜 events</span>
-        <button id="events-dl-btn">CSV</button>
-        <button id="events-clear-btn">Clear</button>
+        <button id="events-dl-btn" data-help="Export the mutation event log as CSV">CSV</button>
+        <button id="events-clear-btn" data-help="Clear the event log">Clear</button>
         <span id="events-count" class="ctl-label">0 events</span>
-      </div>
-    </div>
-
-    <!-- PLAY MODE — distinct alive-green card -->
-    <div class="card card--game">
-      <div class="card__label">Play Mode</div>
-      <div class="card__row">
-        <button id="game-btn">🦠 Steer a microbe<span class="kbd-badge">G</span></button>
       </div>
     </div>
 
@@ -1708,20 +2131,11 @@
     <div class="card card--shortcuts">
       <div class="card__label">Shortcuts</div>
       <div class="shortcuts-list">
+        <div id="wasd-hint" style="display:none"><kbd>W A S D</kbd> <kbd>← ↑ ↓ →</kbd> <span class="desc">steer your microbe — or press &amp; hold on the canvas</span></div>
         <kbd>M</kbd>           <span class="desc">open / close this panel</span>
-        <kbd>Space</kbd>       <span class="desc">pause / resume</span>
-        <kbd>V</kbd>           <span class="desc">cycle view (Educational → Microscope → Classic)</span>
-        <kbd>B</kbd>           <span class="desc">soup brush</span>
-        <kbd>W</kbd>           <span class="desc">water brush</span>
-        <kbd>C</kbd>           <span class="desc">clear all water</span>
-        <kbd>P</kbd>           <span class="desc">lysin on / off</span>
-        <kbd>R</kbd>           <span class="desc">record video</span>
-        <kbd>G</kbd>           <span class="desc">play mode (steer a microbe)</span>
-        <kbd>N</kbd>           <span class="desc">noise on / off</span>
-        <kbd>H</kbd>           <span class="desc">hydrolysis on / off</span>
-        <kbd>[</kbd>           <span class="desc">quicksave</span>
-        <kbd>]</kbd>           <span class="desc">quickload</span>
-        <kbd>F</kbd>           <span class="desc">freeze (pause + zero noise + quicksave)</span>
+        <kbd>,</kbd>           <span class="desc">quicksave</span>
+        <kbd>.</kbd>           <span class="desc">quickload</span>
+        <kbd>Q</kbd>           <span class="desc">freeze (pause + zero noise + quicksave)</span>
         <kbd>Del</kbd>         <span class="desc">delete selected atom (in Select mode)</span>
         <kbd>Esc</kbd>         <span class="desc">close panel / back to pan</span>
         <kbd>drag</kbd>        <span class="desc">pan camera</span>

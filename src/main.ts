@@ -14,11 +14,17 @@
 //
 // No physics state lives here.
 
-import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, SelectionExportMsg, SelectionState, CustomAtomDef, CustomRuleSpec, SaveState, STRIDE } from './snapshot';
+// Injected by esbuild at build time from package.json "version"
+// (--define:APP_VERSION in the build script) so the credits modal
+// always shows the version that was actually bundled.
+declare const APP_VERSION: string;
+
+import { ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, SelectionExportMsg, FireRejectedMsg, PlayerHitMsg, DartHitMsg, SelectionState, CustomAtomDef, CustomRuleSpec, SaveState, STRIDE } from './snapshot';
 import { setCustomAtomColor as setGPUCustomColor } from './renderer-gpu';
 import { setClassicAtomColor, setEducationalAtomColor } from './renderer-2d';
-import { draw2D, draw2DClassic, drawHUD2D, drawArenaBorder } from './renderer-2d';
+import { draw2D, draw2DClassic, drawHUD2D, drawGameHUD2D, drawArenaBorder, HUD_STATS_RECT } from './renderer-2d';
 import { initGPU, drawGPU } from './renderer-gpu';
+import { startTutorial, observeControl } from './tutorial';
 
 // Big arena (~13× the original area). The canvas itself is viewport-sized;
 // we render only what the camera sees. Pan with mouse drag, zoom with wheel.
@@ -53,12 +59,176 @@ const overlayCtx = overlay.getContext('2d')!;
 // Initial: fit arena to viewport (we let user zoom in from there).
 const fitZoom = Math.min(VIEW_W / GRID_W, VIEW_H / GRID_H);
 const camera = {
-  x: (GRID_W - VIEW_W / fitZoom) / 2,
-  y: (GRID_H - VIEW_H / fitZoom) / 2,
+  x: Math.max(0, (GRID_W - VIEW_W / fitZoom) / 2),
+  y: Math.max(0, (GRID_H - VIEW_H / fitZoom) / 2),
   zoom: fitZoom,
 };
-const MIN_ZOOM = fitZoom * 0.5;
+// The arena always fills the viewport — zooming out past fit would
+// show empty margin around the grid. MIN_ZOOM tracks the canvas size:
+// resizeCanvasToDisplay recomputes it when the internal resolution
+// follows a window resize.
+let MIN_ZOOM = fitZoom;
 const MAX_ZOOM = 6;
+
+// Clamp a camera position into the arena at the given zoom: top-left on
+// the axis where the view is larger than the grid (margin collects on
+// the right or bottom edge), clamped on the axis where it is smaller.
+function clampCamXY(x: number, y: number, zoom: number): { x: number; y: number } {
+  const vw = canvas.width / zoom;
+  const vh = canvas.height / zoom;
+  return {
+    x: vw >= GRID_W ? 0 : Math.max(0, Math.min(GRID_W - vw, x)),
+    y: vh >= GRID_H ? 0 : Math.max(0, Math.min(GRID_H - vh, y)),
+  };
+}
+function clampCameraToArena(): void {
+  const c = clampCamXY(camera.x, camera.y, camera.zoom);
+  camera.x = c.x;
+  camera.y = c.y;
+}
+
+// ── Fit snap ──────────────────────────────────────────────────────────
+// Hitting the zoom floor eases the camera into the fully-fitted,
+// top-left-pinned position over ~0.5 s instead of jumping. Any manual
+// camera move (pan, wheel-in, pinch, follow, scripted focus) cancels
+// the tween.
+const SNAP_MS = 500;
+let camSnap: {
+  t0: number;
+  fx: number; fy: number; fz: number;
+  tx: number; ty: number; tz: number;
+} | null = null;
+
+function snapCameraToFit(): void {
+  const t = clampCamXY(camera.x, camera.y, MIN_ZOOM);
+  camSnap = {
+    t0: performance.now(),
+    fx: camera.x, fy: camera.y, fz: camera.zoom,
+    tx: t.x, ty: t.y, tz: MIN_ZOOM,
+  };
+}
+
+// Called once per frame from the render loop.
+function snapTick(): void {
+  if (!camSnap) return;
+  const t = Math.min(1, (performance.now() - camSnap.t0) / SNAP_MS);
+  const e = 1 - (1 - t) * (1 - t) * (1 - t); // ease-out cubic
+  camera.x    = camSnap.fx + (camSnap.tx - camSnap.fx) * e;
+  camera.y    = camSnap.fy + (camSnap.ty - camSnap.fy) * e;
+  camera.zoom = camSnap.fz + (camSnap.tz - camSnap.fz) * e;
+  if (t >= 1) camSnap = null;
+}
+
+// ── Fluid canvas sizing ───────────────────────────────────────────────
+// On landscape layouts the canvas display box fills the window width
+// and the height left under the page chrome (see the FLUID CANVAS media
+// queries in index.html). The internal resolution tracks the box 1:1,
+// so resizing only reframes the arena — nothing stretches. Portrait
+// mobile is excluded: it keeps the fixed 800×1400 internal resolution
+// with CSS aspect scaling.
+const FILL_MQ = '(min-width: 901px) and (pointer: fine), (orientation: landscape)';
+function resizeCanvasToDisplay(): void {
+  if (!window.matchMedia(FILL_MQ).matches) return;
+  const w = Math.max(1, Math.round(canvas.clientWidth));
+  const h = Math.max(1, Math.round(canvas.clientHeight));
+  if (w === canvas.width && h === canvas.height) return;
+  camSnap = null;
+  canvas.width = overlay.width = w;
+  canvas.height = overlay.height = h;
+  // A camera sitting at the old minimum stays fully zoomed out on the
+  // new box; a zoomed-in camera keeps its zoom unless it now exceeds
+  // the allowed range.
+  const wasFullyOut = camera.zoom <= MIN_ZOOM + 1e-9;
+  MIN_ZOOM = Math.min(w / GRID_W, h / GRID_H);
+  camera.zoom = wasFullyOut ? MIN_ZOOM
+    : Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, camera.zoom));
+  clampCameraToArena();
+}
+resizeCanvasToDisplay();
+let _resizeRaf = 0;
+window.addEventListener('resize', () => {
+  if (_resizeRaf) return;
+  _resizeRaf = requestAnimationFrame(() => {
+    _resizeRaf = 0;
+    resizeCanvasToDisplay();
+    // The HUD toggle's docked position is in canvas-internal px —
+    // recompute it whenever the display scale changes.
+    applyHudVisibility();
+  });
+});
+
+// ── Camera follow — tracks a captured set of atoms by ID ──────────────────
+// On activation the atom IDs of the current selection (snapshot flag bit4)
+// are captured; from then on the centroid of *those atoms* is followed, so
+// clearing the selection afterwards does not drop the track. Pure
+// main-thread work — no extra worker messages needed.
+let followIds: Set<number> | null = null;
+// Game start pre-selects a player atom in the worker — this flag arms
+// follow as soon as that selection arrives in a snapshot.
+let armFollowOnSelection = false;
+const followBtn = document.getElementById('follow-btn') as HTMLButtonElement | null;
+
+function setFollow(on: boolean): void {
+  if (on) {
+    const snap = lastSnapshot;
+    followIds = new Set<number>();
+    if (snap) {
+      for (let i = 0; i < snap.atomCount; i++) {
+        if (((snap.atoms[i * STRIDE + 3] | 0) & 16) !== 0) followIds.add(snap.atomIds[i]);
+      }
+    }
+    if (followIds.size === 0) {
+      followIds = null;
+      logStatus('⚠ Follow: nothing selected — select atoms first (🎯 tool)');
+    }
+  } else {
+    followIds = null;
+  }
+  const followState = followBtn?.querySelector<HTMLElement>('.brush-state');
+  if (followState) followState.textContent = followIds ? 'ON' : 'OFF';
+}
+if (followBtn) followBtn.addEventListener('click', () => setFollow(!followIds));
+
+// Called once per rendered frame while following. The centroid is
+// re-sampled at most every SNAP_MS and reached via the snap tween — the
+// camera glides to each sample instead of jittering frame-by-frame.
+function followTick(snap: SnapshotMsg): void {
+  let sx = 0, sy = 0, n = 0;
+  for (let i = 0; i < snap.atomCount; i++) {
+    if (!followIds!.has(snap.atomIds[i])) continue;
+    sx += snap.atoms[i * STRIDE];
+    sy += snap.atoms[i * STRIDE + 1];
+    n++;
+  }
+  if (n === 0) {
+    setFollow(false);
+    logStatus('[CAM] follow stopped — tracked atoms gone');
+    return;
+  }
+  const now = performance.now();
+  if (camSnap && now - camSnap.t0 < SNAP_MS) return;
+  const c = clampCamXY(
+    sx / n - canvas.width  / camera.zoom / 2,
+    sy / n - canvas.height / camera.zoom / 2,
+    camera.zoom,
+  );
+  camSnap = {
+    t0: now,
+    fx: camera.x, fy: camera.y, fz: camera.zoom,
+    tx: c.x, ty: c.y, tz: camera.zoom,
+  };
+}
+
+// Center the camera on a world point at a zoom that fits `radius` snugly —
+// used by scripted focuses (tutorial demos).
+function focusOn(x: number, y: number, radius: number): void {
+  camSnap = null;
+  const z = 0.8 * Math.min(canvas.width, canvas.height) / (2 * radius);
+  camera.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+  camera.x = x - canvas.width / camera.zoom / 2;
+  camera.y = y - canvas.height / camera.zoom / 2;
+  clampCameraToArena();
+}
 
 // Mouse interactivity — behavior depends on brushMode (declared later but
 // referenced via closure that reads the mutable variable each event).
@@ -141,7 +311,12 @@ function finishSelect(clientX: number, clientY: number): void {
 canvas.addEventListener('mousedown', (e) => {
   dragging = true; lastMx = e.clientX; lastMy = e.clientY;
   if (brushMode === 'pan') {
-    canvas.style.cursor = 'grabbing';
+    if (gameMode) {
+      // Press & hold steers the microbe toward the pointer.
+      steerTarget = screenToWorld(e.clientX, e.clientY);
+    } else {
+      canvas.style.cursor = 'grabbing';
+    }
   } else if (brushMode === 'select') {
     const w = screenToWorld(e.clientX, e.clientY);
     selectBoxStart = { x: w.x, y: w.y };
@@ -154,6 +329,13 @@ canvas.addEventListener('mousedown', (e) => {
 window.addEventListener('mousemove', (e) => {
   if (!dragging) return;
   if (brushMode === 'pan') {
+    if (gameMode) {
+      // Steering, not panning — the press point follows the pointer.
+      if (steerTarget) steerTarget = screenToWorld(e.clientX, e.clientY);
+      return;
+    }
+    if (followIds !== null) setFollow(false); // user takes the camera back
+    camSnap = null;
     const d = clientDeltaToWorld(e.clientX - lastMx, e.clientY - lastMy);
     camera.x -= d.dx;
     camera.y -= d.dy;
@@ -177,6 +359,7 @@ window.addEventListener('mousemove', (e) => {
 window.addEventListener('mouseup', (e) => {
   if (dragging && brushMode === 'select') finishSelect(e.clientX, e.clientY);
   dragging = false;
+  endSteer();
   canvas.style.cursor = brushMode === 'pan' ? 'grab' : 'crosshair';
 });
 canvas.style.cursor = 'grab';
@@ -185,13 +368,31 @@ canvas.style.cursor = 'grab';
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
   const c = clientToCanvas(e.clientX, e.clientY);
-  const worldX = c.x / camera.zoom + camera.x;
-  const worldY = c.y / camera.zoom + camera.y;
-  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  // Follow mode survives zooming: the tracked atoms stay centered, so
+  // the zoom pivots on the view center instead of the cursor.
+  const following = followIds !== null;
+  const worldX = following
+    ? camera.x + canvas.width / camera.zoom / 2
+    : c.x / camera.zoom + camera.x;
+  const worldY = following
+    ? camera.y + canvas.height / camera.zoom / 2
+    : c.y / camera.zoom + camera.y;
+  const ax = following ? canvas.width / 2 : c.x;
+  const ay = following ? canvas.height / 2 : c.y;
+  // Proportional zoom: scale with the wheel delta so one mouse notch
+  // (~100 px) is a gentle ~5 % step and high-resolution trackpad deltas
+  // glide instead of jumping. deltaMode 1 (lines) is normalized to px.
+  const deltaPx = e.deltaY * (e.deltaMode === 1 ? 16 : 1);
+  const factor = Math.exp(-deltaPx * 0.0005);
   const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, camera.zoom * factor));
-  camera.x = worldX - c.x / newZoom;
-  camera.y = worldY - c.y / newZoom;
-  camera.zoom = newZoom;
+  if (newZoom <= MIN_ZOOM) {
+    snapCameraToFit();
+  } else {
+    camSnap = null;
+    camera.x = worldX - ax / newZoom;
+    camera.y = worldY - ay / newZoom;
+    camera.zoom = newZoom;
+  }
 }, { passive: false });
 
 // ── Touch handlers — mobile support ───────────────────────────────────────
@@ -227,6 +428,9 @@ canvas.addEventListener('touchstart', (e: TouchEvent) => {
       selectAnchorScreen = { x: t.clientX, y: t.clientY };
     } else if (brushMode !== 'pan') {
       applyBrushAt(t.clientX, t.clientY);
+    } else if (gameMode) {
+      // Press & hold steers the microbe toward the touch point.
+      steerTarget = screenToWorld(t.clientX, t.clientY);
     }
   } else if (e.touches.length === 2) {
     activeGesture = 'pinch';
@@ -262,19 +466,40 @@ canvas.addEventListener('touchmove', (e: TouchEvent) => {
     if (pinchStartDist > 0 && newDist > 0) {
       const scale = newDist / pinchStartDist;
       const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, pinchStartZoom * scale));
-      const worldX = pinchStartMidX / pinchStartZoom + pinchStartCamX;
-      const worldY = pinchStartMidY / pinchStartZoom + pinchStartCamY;
-      camera.x = worldX - newMidCanvas.x / newZoom;
-      camera.y = worldY - newMidCanvas.y / newZoom;
-      camera.zoom = newZoom;
+      if (newZoom <= MIN_ZOOM) {
+        snapCameraToFit();
+      } else {
+        camSnap = null;
+        // Follow mode survives pinch zoom — pivot on the view center
+        // (tracked atoms) instead of the finger midpoint.
+        const following = followIds !== null;
+        const worldX = following
+          ? pinchStartCamX + canvas.width / pinchStartZoom / 2
+          : pinchStartMidX / pinchStartZoom + pinchStartCamX;
+        const worldY = following
+          ? pinchStartCamY + canvas.height / pinchStartZoom / 2
+          : pinchStartMidY / pinchStartZoom + pinchStartCamY;
+        const ax = following ? canvas.width / 2 : newMidCanvas.x;
+        const ay = following ? canvas.height / 2 : newMidCanvas.y;
+        camera.x = worldX - ax / newZoom;
+        camera.y = worldY - ay / newZoom;
+        camera.zoom = newZoom;
+      }
     }
   } else if (activeGesture === 'single' && e.touches.length === 1 && dragging) {
     const t = e.touches[0];
     if (brushMode === 'pan') {
-      const d = clientDeltaToWorld(t.clientX - lastMx, t.clientY - lastMy);
-      camera.x -= d.dx;
-      camera.y -= d.dy;
-      lastMx = t.clientX; lastMy = t.clientY;
+      if (gameMode) {
+        // Steering, not panning — the press point follows the finger.
+        if (steerTarget) steerTarget = screenToWorld(t.clientX, t.clientY);
+      } else {
+        if (followIds !== null) setFollow(false); // user takes the camera back
+        camSnap = null;
+        const d = clientDeltaToWorld(t.clientX - lastMx, t.clientY - lastMy);
+        camera.x -= d.dx;
+        camera.y -= d.dy;
+        lastMx = t.clientX; lastMy = t.clientY;
+      }
     } else if (brushMode === 'select') {
       if (selectBoxStart) {
         const w = screenToWorld(t.clientX, t.clientY);
@@ -301,6 +526,7 @@ canvas.addEventListener('touchend', (e: TouchEvent) => {
     }
     activeGesture = 'none';
     dragging = false;
+    endSteer();
   } else if (e.touches.length === 1 && activeGesture === 'pinch') {
     // Lifted one finger of a pinch — transition into single-finger pan
     // without firing a brush stroke.
@@ -315,6 +541,7 @@ canvas.addEventListener('touchend', (e: TouchEvent) => {
 canvas.addEventListener('touchcancel', () => {
   activeGesture = 'none';
   dragging = false;
+  endSteer();
 }, { passive: true });
 
 // ── Worker ──────────────────────────────────────────────────────────────────
@@ -324,7 +551,7 @@ canvas.addEventListener('touchcancel', () => {
 // extra worker.js fetch per session — irrelevant for a sim that runs
 // for minutes/hours.
 const worker = new Worker('dist/worker.js?v=' + Date.now());
-function send(msg: ControlMsg): void { worker.postMessage(msg); }
+function send(msg: ControlMsg): void { observeControl(msg); worker.postMessage(msg); }
 function sendTransfer(msg: ControlMsg, transferables: Transferable[]): void {
   worker.postMessage(msg, transferables);
 }
@@ -336,7 +563,7 @@ function sendTransfer(msg: ControlMsg, transferables: Transferable[]): void {
 // caused a deadlock when the worker only had 2 buffers in its pool).
 let lastSnapshot: SnapshotMsg | null = null;
 
-type WorkerMsg = SnapshotMsg | BurnProgressMsg | BurnDoneMsg | SaveStateMsg | LoadResultMsg | EventLogChunkMsg | SelectionExportMsg;
+type WorkerMsg = SnapshotMsg | BurnProgressMsg | BurnDoneMsg | SaveStateMsg | LoadResultMsg | EventLogChunkMsg | SelectionExportMsg | FireRejectedMsg | PlayerHitMsg | DartHitMsg;
 
 worker.onmessage = (e: MessageEvent<WorkerMsg>) => {
   const data = e.data;
@@ -357,6 +584,27 @@ worker.onmessage = (e: MessageEvent<WorkerMsg>) => {
   if (data.type === 'loadResult')   { onLoadResult(data);   return; }
   if (data.type === 'eventLogChunk'){ onEventLogChunk(data); return; }
   if (data.type === 'selectionExport') { onSelectionExport(data); return; }
+  if (data.type === 'fireRejected') {
+    // The worker is the authority on both gates — a stale mirrored
+    // cooldown or magazine can let a press through that still needs
+    // a visible explanation.
+    logStatus(data.reason === 'cooldown' ? 'Reloading…' : 'Out of lysin — fly through orange p-atoms to rearm');
+    return;
+  }
+  if (data.type === 'playerHit') {
+    lastBiteAt = performance.now();
+    // Bites can land in bursts during a sustained hug — the red flash
+    // fires every time, the status line only every couple of seconds.
+    if (performance.now() - lastBiteStatusAt > 2000) {
+      lastBiteStatusAt = performance.now();
+      logStatus('⚠ membrane breached — break contact!');
+    }
+    return;
+  }
+  if (data.type === 'dartHit') {
+    logStatus('☄ direct hit — lysin cloud released');
+    return;
+  }
 };
 
 // ── State (UI-only) ─────────────────────────────────────────────────────────
@@ -368,7 +616,6 @@ let lysinActive = false;
 let viewMode: ViewMode = 'educational';
 let bacteriaView = false; // mirror of viewMode === 'microscope', used by GPU/2D draw paths
 let useGPU = false;
-let stepsPerFrame = 8;
 let gameMode = false;
 
 // Brush settings — controllable via UI later if needed
@@ -446,6 +693,76 @@ function logStatus(msg: string): void {
   // Also mirror to console so power users can scroll the history.
   console.log('[primordium]', msg);
 }
+
+// ── Button help hints in the status line ────────────────────────────────────
+// Every control button carries a data-help description. Hovering (or
+// long-pressing on touch) previews that text in the status line without
+// firing the control; leaving restores whatever was there before. A real
+// logStatus() landing while a hint is visible wins — the restore only
+// runs while the hint text is still showing.
+let helpBackup: string | null = null;
+let helpShownFor: Element | null = null;
+let helpTouchTimer = 0;
+let helpSuppressClick = false;
+function showHelpHint(el: Element): void {
+  const help = el.getAttribute('data-help');
+  if (!help || !statusEl) return;
+  if (helpShownFor === null) helpBackup = statusEl.textContent;
+  helpShownFor = el;
+  statusEl.textContent = help;
+}
+function hideHelpHint(el: Element): void {
+  if (helpShownFor !== el || !statusEl) return;
+  if (statusEl.textContent === el.getAttribute('data-help')) {
+    statusEl.textContent = helpBackup;
+  }
+  helpShownFor = null;
+  helpBackup = null;
+}
+// Delegated mouse hover — mouseover/mouseout bubble, closest() resolves
+// the hint owner for lazy or nested content (e.g. kbd badges).
+document.addEventListener('mouseover', (e) => {
+  const el = (e.target as Element).closest?.('[data-help]');
+  if (el && helpShownFor !== el) showHelpHint(el);
+});
+document.addEventListener('mouseout', (e) => {
+  const el = (e.target as Element).closest?.('[data-help]');
+  if (!el) return;
+  // Moving onto a child inside the same hint element is not a leave.
+  const to = (e.relatedTarget as Element | null)?.closest?.('[data-help]');
+  if (to !== el) hideHelpHint(el);
+});
+// Touch has no hover: a 450ms press shows the hint and swallows the
+// synthetic click so the control itself does not fire; releasing hides
+// it again. Short taps pass through untouched.
+document.addEventListener('touchstart', (e) => {
+  window.clearTimeout(helpTouchTimer);
+  helpSuppressClick = false;
+  const el = (e.target as Element).closest?.('[data-help]');
+  if (!el) return;
+  helpTouchTimer = window.setTimeout(() => {
+    helpSuppressClick = true;
+    showHelpHint(el);
+  }, 450);
+}, { passive: true });
+document.addEventListener('touchmove', () => {
+  window.clearTimeout(helpTouchTimer);
+}, { passive: true });
+document.addEventListener('touchend', (e) => {
+  window.clearTimeout(helpTouchTimer);
+  const el = (e.target as Element).closest?.('[data-help]');
+  if (el) hideHelpHint(el);
+}, { passive: true });
+document.addEventListener('touchcancel', () => {
+  window.clearTimeout(helpTouchTimer);
+  helpSuppressClick = false;
+}, { passive: true });
+document.addEventListener('click', (e) => {
+  if (!helpSuppressClick) return;
+  helpSuppressClick = false;
+  e.preventDefault();
+  e.stopPropagation();
+}, true);
 
 // ── UI buttons ───────────────────────────────────────────────────────────────
 const pauseBtn       = document.getElementById('pause-btn')      as HTMLButtonElement;
@@ -532,6 +849,9 @@ function toggleView(): void {
   const desc = viewMode === 'educational' ? 'legend + bonds + bezier membranes'
              : viewMode === 'microscope'  ? 'phase contrast (microscope slide)'
              :                              "Hutton's 2002 squares + straight bond lines";
+  // The ‹/› HUD toggle only docks inside the stats box in educational
+  // view — re-dock it for the new mode.
+  applyHudVisibility();
   logStatus(`View → ${label} (${desc})`);
 }
 
@@ -541,6 +861,10 @@ function setBrush(next: Brush): void {
   soupBrushBtn.classList.toggle('active', brushMode === 'soup');
   waterBrushBtn.classList.toggle('active', brushMode === 'water');
   selectBtn.classList.toggle('active', brushMode === 'select');
+  // ON/OFF suffix in the label so users see the button toggles back to pan
+  soupBrushBtn.querySelector('.brush-state')!.textContent = brushMode === 'soup' ? 'ON' : 'OFF';
+  waterBrushBtn.querySelector('.brush-state')!.textContent = brushMode === 'water' ? 'ON' : 'OFF';
+  selectBtn.querySelector('.brush-state')!.textContent = brushMode === 'select' ? 'ON' : 'OFF';
   canvas.style.cursor = brushMode === 'pan' ? 'grab' : 'crosshair';
   // Leaving select mode → drop any current selection so the halo disappears.
   if (prev === 'select' && brushMode !== 'select') send({ type: 'deselectAll' });
@@ -558,7 +882,7 @@ function clearWater(): void {
 
 // Buttons that are HIDDEN while in microbe-steering mode — controls that
 // don't fit a "you-vs-them" game (sandbox tools).
-const GAME_HIDDEN_BTN_IDS = ['pause-btn', 'soup-brush-btn', 'water-brush-btn', 'clear-water-btn', 'lysin-btn', 'drip-btn', 'burn-btn', 'burn-iters'];
+const GAME_HIDDEN_BTN_IDS = ['soup-brush-btn', 'water-brush-btn', 'clear-water-btn', 'lysin-btn', 'drip-btn', 'burn-btn', 'burn-iters'];
 
 // ── Drip feed (sandbox passive replenishment) ──────────────────────────────
 let dripOn = false;
@@ -602,16 +926,49 @@ let burnTargetIter = 0;
 const burnDefaultLabel = 'Start';
 let burnWallStart = 0;
 
+// The spinner steps adapt to the current order of magnitude — one tenth
+// of it (1000 → ±100, 10000 → ±1000, 500 → ±10). The browser applies
+// whatever `step` is set at click time, so it is recomputed on input.
+const BURN_ITERS_MIN = 100;
+function burnStepFor(v: number): number {
+  const order = Math.floor(Math.log10(Math.max(BURN_ITERS_MIN, v)));
+  return Math.max(1, Math.pow(10, order - 1));
+}
+function syncBurnStep(): void {
+  burnIters.step = String(burnStepFor(parseInt(burnIters.value) || 0));
+}
+burnIters.addEventListener('input', syncBurnStep);
+// The browser reads `step` before dispatching `input` — a value changed
+// without an input event (or whose last input fired at a smaller
+// magnitude) would step with a stale step. Arrow keys and spinner
+// clicks sync on the earlier keydown/pointerdown instead.
+burnIters.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowUp' || e.key === 'ArrowDown') syncBurnStep();
+});
+burnIters.addEventListener('pointerdown', syncBurnStep);
+burnIters.addEventListener('change', () => {
+  // Snap typed values onto the current step grid — an off-grid value
+  // would trigger the browser's step-mismatch warning on the next
+  // spinner press.
+  const v = Math.floor(parseInt(burnIters.value) || 0);
+  if (v > 0) {
+    const step = burnStepFor(v);
+    burnIters.value = String(Math.max(BURN_ITERS_MIN, Math.round(v / step) * step));
+  }
+  syncBurnStep();
+});
+syncBurnStep();
+
 function startBurn(): void {
-  if (burning) { send({ type: 'abortBurn' }); logStatus('Aborting burn…'); return; }
-  const requested = Math.max(1000, Math.floor(parseInt(burnIters.value) || 100000));
+  if (burning) { send({ type: 'abortBurn' }); logStatus('Stopping burn…'); return; }
+  const requested = Math.max(BURN_ITERS_MIN, Math.floor(parseInt(burnIters.value) || 1000));
   const startIter = lastSnapshot?.iterations ?? 0;
   burnStartIter  = startIter;
   burnTargetIter = startIter + requested;
   burnWallStart  = performance.now();
   burning = true;
   burnBtn.classList.add('recording');
-  burnBtn.textContent = '✕ Cancel (0%)';
+  burnBtn.textContent = '✕ Stop (0.00%)';
   send({ type: 'burn', targetIters: burnTargetIter });
   logStatus(`Burn started → +${requested.toLocaleString()} iters (target ${burnTargetIter.toLocaleString()})`);
 }
@@ -620,14 +977,15 @@ function onBurnProgress(p: BurnProgressMsg): void {
   if (!burning) return;
   const span = burnTargetIter - burnStartIter;
   const done = p.iterations - burnStartIter;
-  const pct  = span > 0 ? Math.min(100, Math.round((done / span) * 100)) : 100;
-  burnBtn.textContent = `✕ Cancel (${pct}%)`;
+  const pct  = span > 0 ? Math.min(100, (done / span) * 100) : 100;
+  const pctStr = pct.toFixed(2);
+  burnBtn.textContent = `✕ Stop (${pctStr}%)`;
   // Estimate ETA from current rate.
   const remaining = Math.max(0, burnTargetIter - p.iterations);
   const etaSec = p.stepsPerSec > 0 ? Math.round(remaining / p.stepsPerSec) : 0;
   showStatus(
     `Burning · iter ${p.iterations.toLocaleString()} / ${p.target.toLocaleString()} ` +
-    `(${pct}%) · ${p.stepsPerSec.toLocaleString()} steps/sec · ETA ${etaSec}s`
+    `(${pctStr}%) · ${p.stepsPerSec.toLocaleString()} steps/sec · ETA ${etaSec}s`
   );
 }
 
@@ -636,10 +994,12 @@ function onBurnDone(d: BurnDoneMsg): void {
   burnBtn.classList.remove('recording');
   burnBtn.textContent = burnDefaultLabel;
   const wallSec = (performance.now() - burnWallStart) / 1000;
-  const itersDone = d.iterations - burnStartIter;
+  // A world rebuild can abort a burn with the counter already back at
+  // 0 — the delta would report negative iters otherwise.
+  const itersDone = Math.max(0, d.iterations - burnStartIter);
   const rate = wallSec > 0 ? Math.round(itersDone / wallSec) : 0;
   if (d.aborted) {
-    logStatus(`Burn cancelled @ iter ${d.iterations.toLocaleString()} · processed ${itersDone.toLocaleString()} iters in ${wallSec.toFixed(1)}s (${rate.toLocaleString()} steps/sec)`);
+    logStatus(`Burn stopped @ iter ${d.iterations.toLocaleString()} · processed ${itersDone.toLocaleString()} iters in ${wallSec.toFixed(1)}s (${rate.toLocaleString()} steps/sec)`);
   } else {
     logStatus(`Burn complete @ iter ${d.iterations.toLocaleString()} · ${itersDone.toLocaleString()} iters in ${wallSec.toFixed(1)}s (${rate.toLocaleString()} steps/sec)`);
   }
@@ -652,31 +1012,215 @@ function applyGameModeUI(): void {
   }
   // Brush state cannot persist into game mode (no brush tools available).
   if (gameMode) brushMode = 'pan';
+  // WASD steers the player in game mode — the Select shortcut badge is
+  // hidden while it has no effect, and the shortcuts card explains the
+  // steering keys instead.
+  const wasdHint = document.getElementById('wasd-hint');
+  if (wasdHint) wasdHint.style.display = gameMode ? 'contents' : 'none';
+  const selectBadge = selectBtn?.querySelector<HTMLElement>('.kbd-badge');
+  if (selectBadge) selectBadge.style.display = gameMode ? 'none' : '';
+  // The worker suspends sandbox noise/hydrolysis while a match runs —
+  // the buttons mirror the suspended OFF state and are disabled so no
+  // mid-game click can re-enable hazards the game does not own. On exit
+  // they show the user's sandbox setting again (noiseOn/hydroOn are
+  // unchanged).
+  noiseBtn.textContent = (!gameMode && noiseOn) ? '🧬 Noise: ON' : '🧬 Noise: OFF';
+  noiseBtn.classList.toggle('active', !gameMode && noiseOn);
+  noiseSlidersRow.classList.toggle('shown', !gameMode && noiseOn);
+  noiseBtn.disabled = gameMode;
+  hydroBtn.textContent = (!gameMode && hydroOn) ? '💧🧪 Hydrolysis: ON' : '💧🧪 Hydrolysis: OFF';
+  hydroBtn.classList.toggle('active', !gameMode && hydroOn);
+  hydroSlidersRow.classList.toggle('shown', !gameMode && hydroOn);
+  hydroBtn.disabled = gameMode;
+  // Lysin dart fire pad replaces the top-left legend while a match runs.
+  fireWrap?.classList.toggle('shown', gameMode);
+  firePad?.classList.toggle('shown', gameMode);
+  // On touch layouts the control panel opens as a modal over a backdrop
+  // that would cover the fire pad — dismiss it when a match starts.
+  if (gameMode && panelBackdrop?.classList.contains('shown')) closePanel();
   hideGameOverlay();
 }
 
-function toggleGame(): void {
-  gameMode = !gameMode;
-  gameBtn.textContent = gameMode ? '🦠 Exit game' : '🦠 Steer a microbe';
-  gameBtn.classList.toggle('active', gameMode);
-  send({ type: gameMode ? 'startGame' : 'endGame' });
+// UI-side match exit without sending 'endGame' — used both when the
+// user toggles play mode off and when a loaded save silently ends the
+// match on the worker (its inGame flag is reset on every load while
+// the loaded world must be kept, not rebuilt like endGame does).
+function exitGameModeUI(): void {
+  gameMode = false;
+  gameBtn.textContent = '🦠 Steer a microbe';
+  gameBtn.classList.remove('active');
+  armFollowOnSelection = false;
+  setFollow(false);
   keyState.w = keyState.a = keyState.s = keyState.d = false;
+  steerTarget = null;
+  ringDir = null;
+  steerRing?.classList.remove('steering');
   send({ type: 'setPlayerInput', x: 0, y: 0 });
   applyGameModeUI();
-  logStatus(gameMode
-    ? 'Play mode ON — WASD biases your green microbe (Brownian, not propulsion)'
-    : 'Play mode OFF — sandbox restored');
 }
+
+function toggleGame(): void {
+  if (gameMode) {
+    send({ type: 'endGame' });
+    exitGameModeUI();
+    logStatus('Play mode OFF — sandbox restored');
+    return;
+  }
+  gameMode = true;
+  matchStartAt = performance.now();
+  gameBtn.textContent = '🦠 Exit game';
+  gameBtn.classList.add('active');
+  send({ type: 'startGame' });
+  // The worker pre-selects a player atom in setupGame; the snapshot
+  // loop arms follow once that flag arrives.
+  armFollowOnSelection = true;
+  applyGameModeUI();
+  logStatus('Play mode ON — press & hold on the canvas to steer your microbe (WASD works too)');
+}
+
+// ── Lysin dart fire pad ─────────────────────────────────────────────
+// Game-mode replacement for the legend block: the press position vs.
+// the pad's center is the launch direction, so it works identically on
+// mouse and touch. The needle marks the aim; the conic --cd sweep shows
+// reload, drained each frame from the worker's snapshot fields.
+const fireWrap = document.getElementById('fire-wrap') as HTMLElement | null;
+const steerRing = document.getElementById('steer-ring') as HTMLElement | null;
+const firePad = document.getElementById('fire-pad') as HTMLElement | null;
+const fireNeedle = document.getElementById('fire-needle') as HTMLElement | null;
+const fireEnemy = document.getElementById('fire-enemy') as HTMLElement | null;
+const fireLysin = document.getElementById('fire-lysin') as HTMLElement | null;
+let lastFireCooldownIter = 0; // worker-side reload, mirrored per snapshot
+let minEnemyCount = -1; // lowest enemy loop count seen this match (-1 outside a match)
+let homingSeen = false; // snapshot mirror of the worker's guidance unlock — rising edge logs once per match
+let matchStartAt = -1e9; // performance.now() of match start — suppresses the kill-feed during loop-detection warmup
+let lastBiteAt = -1e9;        // performance.now() of the last enemy bite (drives the damage flash)
+let lastBiteStatusAt = -1e9;  // throttles the 'membrane breached' status text
+
+if (firePad) {
+  firePad.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    const r = firePad.getBoundingClientRect();
+    const dx = e.clientX - (r.left + r.width / 2);
+    const dy = e.clientY - (r.top + r.height / 2);
+    const mag = Math.hypot(dx, dy);
+    if (mag < 4) return; // dead center — no direction to launch along
+    // The needle turns to the aim regardless of reload — it doubles as
+    // the last-shot marker. 0deg is straight up, so offset by 90°.
+    const deg = Math.atan2(dy, dx) * 180 / Math.PI + 90;
+    if (fireNeedle) fireNeedle.style.transform = `rotate(${deg}deg)`;
+    // The mirrored magazine is a fast-path hint only — when it is stale
+    // the 'fire' message still reaches the worker, which answers a real
+    // shortage with 'fireRejected' and the status line explains it.
+    if (lastFireCooldownIter > 0) return; // still reloading
+    send({ type: 'fire', x: dx, y: dy });
+    console.log(`[FIRE] lysovirus requested dir(${(dx / mag).toFixed(2)},${(dy / mag).toFixed(2)})`);
+  });
+}
+
+// Steering ring — the annulus around the fire pad. Holding the ring is a
+// virtual joystick: the direction from the pad center is the swim
+// direction, pushed as a fixed setPlayerInput vector (unlike the canvas
+// hold, which steers toward a world position). While the ring is held it
+// wins over WASD and canvas steering; releasing restores them.
+let ringDir: { x: number; y: number } | null = null;
+
+function pushRingInput(): void {
+  if (!gameMode || !ringDir) return;
+  send({ type: 'setPlayerInput', x: ringDir.x, y: ringDir.y });
+  setMoveGlow(ringDir.x, ringDir.y);
+}
+
+function updateRingDir(e: PointerEvent): void {
+  if (!steerRing) return;
+  const r = steerRing.getBoundingClientRect();
+  const dx = e.clientX - (r.left + r.width / 2);
+  const dy = e.clientY - (r.top + r.height / 2);
+  const mag = Math.hypot(dx, dy);
+  if (mag < 1) return;
+  ringDir = { x: dx / mag, y: dy / mag };
+  pushRingInput();
+}
+
+function endRingSteer(): void {
+  if (!ringDir) return;
+  ringDir = null;
+  steerRing?.classList.remove('steering');
+  pushPlayerInput(); // restores WASD / canvas-hold state
+}
+
+if (steerRing) {
+  steerRing.addEventListener('pointerdown', (e) => {
+    if (!gameMode) return;
+    e.preventDefault();
+    steerRing.setPointerCapture(e.pointerId);
+    steerRing.classList.add('steering');
+    updateRingDir(e);
+  });
+  steerRing.addEventListener('pointermove', (e) => { if (ringDir) updateRingDir(e); });
+  steerRing.addEventListener('pointerup', endRingSteer);
+  steerRing.addEventListener('pointercancel', endRingSteer);
+}
+
+// ── HUD hide/show ─────────────────────────────────────────────────────────
+// The stats + legend block in the top-left corner can be collapsed to a
+// small arrow so it never obstructs the sim. While the HUD is drawn
+// (educational view) the arrow docks inside the stats box's top-right
+// corner; collapsed it floats in the canvas corner on its own. The
+// choice persists across sessions.
+const HUD_STATE_KEY = 'primordium-hud-v1';
+const hudToggleBtn = document.getElementById('hud-toggle') as HTMLButtonElement | null;
+let hudVisible = ((): boolean => {
+  try { return localStorage.getItem(HUD_STATE_KEY) !== '0'; } catch { return true; }
+})();
+function positionHudToggle(): void {
+  if (!hudToggleBtn || !hudVisible || viewMode !== 'educational') return;
+  // Docked left-aligned inside the stats box, vertically centered next
+  // to the text. Convert internal px into CSS px — the button is fixed
+  // 26 CSS px while the canvas may be scaled (portrait mobile).
+  const s = (canvas.clientWidth || canvas.width) / canvas.width;
+  hudToggleBtn.style.left = `${(HUD_STATS_RECT.x + 8) * s}px`;
+  hudToggleBtn.style.top  = `${(HUD_STATS_RECT.y + HUD_STATS_RECT.h / 2) * s - 13}px`;
+}
+function applyHudVisibility(): void {
+  if (!hudToggleBtn) return;
+  hudToggleBtn.textContent = hudVisible ? '‹' : '›';
+  const docked = hudVisible && viewMode === 'educational';
+  // Docked inside the dark stats box the backdrop-blend turns the button
+  // almost black — the .docked style gives it the same perceived color
+  // and transparency as when it floats over the bright canvas.
+  hudToggleBtn.classList.toggle('docked', docked);
+  if (docked) {
+    positionHudToggle();
+  } else {
+    hudToggleBtn.style.left = '8px';
+    hudToggleBtn.style.top  = '8px';
+  }
+}
+if (hudToggleBtn) {
+  hudToggleBtn.addEventListener('click', () => {
+    hudVisible = !hudVisible;
+    try { localStorage.setItem(HUD_STATE_KEY, hudVisible ? '1' : '0'); } catch { /* private mode */ }
+    applyHudVisibility();
+  });
+}
+applyHudVisibility();
 
 // ── Win/Lose overlay ───────────────────────────────────────────────────────
 const overlayEl = document.getElementById('game-overlay') as HTMLDivElement;
 const overlayTitle = document.getElementById('game-overlay-title') as HTMLDivElement;
 const overlaySub   = document.getElementById('game-overlay-sub')   as HTMLDivElement;
+const gameAgainBtn = document.getElementById('game-again') as HTMLButtonElement;
+const gameExitBtn  = document.getElementById('game-exit')  as HTMLButtonElement;
+// overlayShownStatus: 0 hidden, 1 won, 2 lost, 3 first-visit intro.
 let overlayShownStatus = 0;
+const INTRO_SEEN_KEY = 'evoloom-intro-v1';
 
 function showGameOverlay(status: number): void {
   if (overlayShownStatus === status) return;
   overlayShownStatus = status;
+  overlayEl.classList.remove('blocking');
+  gameAgainBtn.innerHTML = '↻ play again <kbd>↵</kbd>';
+  gameExitBtn.textContent = '✕ sandbox';
   if (status === 1) {
     overlayTitle.textContent = '🏆 You won';
     overlayTitle.style.color = '#5edca0';
@@ -690,14 +1234,121 @@ function showGameOverlay(status: number): void {
 }
 function hideGameOverlay(): void {
   overlayShownStatus = 0;
+  overlayEl.classList.remove('blocking');
   overlayEl.style.display = 'none';
 }
 
-// ── WASD input → biased Brownian. We track which of W/A/S/D are down and
-// send a normalized direction vector to the worker whenever the set changes.
+// First-visit intro — same overlay shell as game over, but a modal
+// choice between jumping into play mode or exploring the sandbox.
+// localStorage remembers the visit; only the win/lose states reuse
+// the overlay afterwards.
+function showIntroOverlay(): void {
+  overlayShownStatus = 3;
+  overlayEl.classList.add('blocking');
+  overlayTitle.textContent = 'EVOLOOM';
+  overlayTitle.style.color = '#d4a64f';
+  overlaySub.textContent = 'An artificial chemistry — steer a living cell against the swarm, or just watch the soup evolve.';
+  gameAgainBtn.textContent = '▶ start game';
+  gameExitBtn.textContent = '🧬 simulation';
+  overlayEl.style.display = 'flex';
+}
+function dismissIntro(): void {
+  try { localStorage.setItem(INTRO_SEEN_KEY, '1'); } catch { /* private mode — intro returns next visit */ }
+  hideGameOverlay();
+}
+function introSeen(): boolean {
+  try { return localStorage.getItem(INTRO_SEEN_KEY) === '1'; } catch { return true; }
+}
+
+// End-of-match actions — the overlay blocks nothing else, so the only
+// way forward used to be the G shortcut. "again" re-runs the same
+// worker start path as the first match; "sandbox" is the normal exit.
+function restartMatch(): void {
+  matchStartAt = performance.now();
+  send({ type: 'startGame' });
+  armFollowOnSelection = true;
+  hideGameOverlay();
+}
+gameAgainBtn?.addEventListener('click', () => {
+  if (overlayShownStatus === 3) { dismissIntro(); if (!gameMode) toggleGame(); }
+  else restartMatch();
+});
+gameExitBtn?.addEventListener('click', () => {
+  if (overlayShownStatus === 3) { dismissIntro(); return; }
+  if (gameMode) toggleGame();
+});
+// Clicking the dimmed backdrop of the intro equals choosing the
+// sandbox — standard click-outside-dismiss for a modal choice.
+overlayEl?.addEventListener('click', (e) => {
+  if (overlayShownStatus === 3 && e.target === overlayEl) dismissIntro();
+});
+
+// ── WASD/arrow input → biased Brownian. We track which of the eight
+// steering keys are down and send a normalized direction vector to the
+// worker whenever the set changes.
 const keyState = { w: false, a: false, s: false, d: false };
+// Arrow keys share the WASD state flags — four direction slots, not
+// eight, so W+ArrowUp still read as one held "up".
+const MOVE_KEYS: Record<string, 'w' | 'a' | 's' | 'd'> = {
+  KeyW: 'w', ArrowUp: 'w',
+  KeyA: 'a', ArrowLeft: 'a',
+  KeyS: 's', ArrowDown: 's',
+  KeyD: 'd', ArrowRight: 'd',
+};
+
+// Press-to-steer (game mode, no tool selected): while the pointer is held
+// on the canvas, the microbe swims toward the pointer's world position.
+// The direction is recomputed every frame because the player keeps moving.
+let steerTarget: { x: number; y: number } | null = null;
+let steerLastX = 0, steerLastY = 0;
+// Dead zone around the target in world units — inside it the microbe is
+// close enough that steering stops, avoiding jitter on the spot.
+const STEER_ARRIVE_RADIUS = 15;
+
+function playerCenterWorld(): { x: number; y: number } | null {
+  const snap = lastSnapshot;
+  if (!snap) return null;
+  let sx = 0, sy = 0, n = 0;
+  for (let i = 0; i < snap.atomCount; i++) {
+    // Atom flags bit3 = playerControlled (see packSnapshot in the worker).
+    if (((snap.atoms[i * STRIDE + 3] | 0) & 8) !== 0) {
+      sx += snap.atoms[i * STRIDE];
+      sy += snap.atoms[i * STRIDE + 1];
+      n++;
+    }
+  }
+  return n > 0 ? { x: sx / n, y: sy / n } : null;
+}
+
+function pushSteerInput(): void {
+  if (!gameMode || !steerTarget || ringDir) return;
+  let dx = 0, dy = 0;
+  const c = playerCenterWorld();
+  if (c) {
+    dx = steerTarget.x - c.x;
+    dy = steerTarget.y - c.y;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len > STEER_ARRIVE_RADIUS) { dx /= len; dy /= len; }
+    else { dx = 0; dy = 0; }
+  }
+  if (dx !== steerLastX || dy !== steerLastY) {
+    steerLastX = dx; steerLastY = dy;
+    send({ type: 'setPlayerInput', x: dx, y: dy });
+  }
+  setMoveGlow(dx, dy);
+}
+
+function endSteer(): void {
+  if (!steerTarget) return;
+  steerTarget = null;
+  steerLastX = steerLastY = 0;
+  pushPlayerInput(); // restores the WASD state (usually 0,0)
+}
+
 function pushPlayerInput(): void {
   if (!gameMode) return;
+  if (ringDir) { pushRingInput(); return; }
+  if (steerTarget) { pushSteerInput(); return; }
   let dx = 0, dy = 0;
   if (keyState.d) dx += 1;
   if (keyState.a) dx -= 1;
@@ -706,6 +1357,21 @@ function pushPlayerInput(): void {
   const len = Math.sqrt(dx * dx + dy * dy);
   if (len > 0) { dx /= len; dy /= len; }
   send({ type: 'setPlayerInput', x: dx, y: dy });
+  setMoveGlow(dx, dy);
+}
+
+// Movement shimmer — a green wedge on the fire pad rim rotated to the
+// live steering direction (same convention as the needle: 0deg = up).
+// Instant feedback for key/hold input, gone the moment input stops.
+function setMoveGlow(dx: number, dy: number): void {
+  if (!firePad) return;
+  if (dx === 0 && dy === 0) { firePad.classList.remove('moving'); return; }
+  firePad.classList.add('moving');
+  firePad.style.setProperty('--mdeg', `${(Math.atan2(dy, dx) * 180 / Math.PI + 90).toFixed(1)}deg`);
+  // The marble rolls to mid-groove in the steer direction — every input
+  // source lands here, so WASD moves it exactly like the ring press.
+  steerRing?.style.setProperty('--bx', `${(dx * 128).toFixed(1)}px`);
+  steerRing?.style.setProperty('--by', `${(dy * 128).toFixed(1)}px`);
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────
@@ -755,10 +1421,20 @@ const soupVal     = document.getElementById('soup-val')!;
 const dampSlider  = document.getElementById('damp-slider') as HTMLInputElement;
 const dampVal     = document.getElementById('damp-val')!;
 
+// Speed is a rate limit, not a step multiplier — 100% lets the worker's
+// auto-pacing run flat out, lower values stretch steps across ticks for
+// smooth slow motion without tearing the frame rate.
+// Browsers restore range inputs to their last value on reload without
+// firing 'input', so the model and label must come from the DOM, not a
+// hard-coded default — otherwise the slider could show 5% while the sim
+// runs at 100%.
+let simRate = parseInt(speedSlider.value) / 100;
+speedVal.textContent = speedSlider.value + '%';
+send({ type: 'setSimRate', v: simRate });
 speedSlider.addEventListener('input', () => {
-  stepsPerFrame = parseInt(speedSlider.value);
-  speedVal.textContent = speedSlider.value;
-  send({ type: 'setStepsPerFrame', n: stepsPerFrame });
+  simRate = parseInt(speedSlider.value) / 100;
+  speedVal.textContent = speedSlider.value + '%';
+  send({ type: 'setSimRate', v: simRate });
 });
 soupSlider.addEventListener('input', () => {
   const v = parseInt(soupSlider.value) / 100;
@@ -871,7 +1547,7 @@ function quickSave(): void {
 }
 function quickLoad(): void {
   if (!quicksaveSlot) {
-    logStatus('No quicksave to restore — press [ first to save current state');
+    logStatus('No quicksave to restore — press , first to save current state');
     return;
   }
   send({ type: 'loadSave', state: quicksaveSlot });
@@ -892,6 +1568,32 @@ const inspectorModal       = document.getElementById('inspector')           as H
 const inspectorCanvas      = document.getElementById('inspector-canvas')    as HTMLCanvasElement | null;
 const inspectorStats       = document.getElementById('inspector-stats')     as HTMLDivElement | null;
 const inspectorClose       = document.getElementById('inspector-close')     as HTMLButtonElement | null;
+
+// Floating popups race for the topmost layer: whichever was clicked last
+// wins. #tutorial-overlay is created lazily by the tutorial module, so
+// clicks are delegated on document and resolved at event time. The
+// tutorial card lives inside that overlay's stacking context, so its
+// click raises the overlay. .inspector is a context-free wrapper: its
+// .inspector-card is raised on click while the .inspector-backdrop keeps
+// its low base z — pinning the tutorial overlay just under the card
+// leaves it above the dim/blur layer instead of buried beneath it.
+let popupZ = 400;
+document.addEventListener('pointerdown', (e) => {
+  const target = e.target as HTMLElement | null;
+  if (!target) return;
+  if (target.closest('#tutorial-card')) {
+    const overlay = document.getElementById('tutorial-overlay');
+    if (overlay) overlay.style.zIndex = String(++popupZ);
+    return;
+  }
+  const popup = target.closest('.inspector');
+  if (popup instanceof HTMLElement) {
+    const card = popup.querySelector('.inspector-card');
+    if (card instanceof HTMLElement) card.style.zIndex = String(++popupZ);
+    const overlay = document.getElementById('tutorial-overlay');
+    if (overlay) overlay.style.zIndex = String(popupZ - 1);
+  }
+});
 const inspectorDownload    = document.getElementById('inspector-download')  as HTMLButtonElement | null;
 const inspectorLoad        = document.getElementById('inspector-load')      as HTMLButtonElement | null;
 const inspectBtn           = document.getElementById('inspect-btn')         as HTMLButtonElement | null;
@@ -1722,13 +2424,15 @@ if (crClearBtn) crClearBtn.addEventListener('click', () => {
 const labModal   = document.getElementById('lab-modal') as HTMLDivElement | null;
 const labOpenBtn = document.getElementById('lab-open-btn') as HTMLButtonElement | null;
 const labCloseBtn = document.getElementById('lab-close')   as HTMLButtonElement | null;
-function openLab(): void {
+const dictBtn    = document.getElementById('dict-btn')    as HTMLButtonElement | null;
+function openLab(tab: 'editor' | 'dictionary' = 'editor'): void {
   if (!labModal) return;
   refreshCustomLists();
   refreshRuleTypeSelectors();
   refreshCRowVisibility();
   labModal.classList.add('shown');
   labModal.setAttribute('aria-hidden', 'false');
+  showLabTab(tab);
 }
 function closeLab(): void {
   if (!labModal) return;
@@ -1738,8 +2442,34 @@ function closeLab(): void {
 function isLabOpen(): boolean {
   return !!labModal && labModal.classList.contains('shown');
 }
-if (labOpenBtn) labOpenBtn.addEventListener('click', openLab);
+function isDictionaryOpen(): boolean {
+  return isLabOpen() && !!labTabDictionary && !labTabDictionary.hidden;
+}
+if (labOpenBtn) labOpenBtn.addEventListener('click', () => openLab('editor'));
+if (dictBtn) dictBtn.addEventListener('click', () => openLab('dictionary'));
 if (labCloseBtn) labCloseBtn.addEventListener('click', closeLab);
+
+// ── Credits modal ────────────────────────────────────────────────────
+const creditsModal   = document.getElementById('credits-modal')    as HTMLElement | null;
+const creditsOpenBtn = document.getElementById('credits-open')     as HTMLButtonElement | null;
+const creditsClose   = document.getElementById('credits-close')    as HTMLButtonElement | null;
+const creditsVersion = document.getElementById('credits-version')  as HTMLElement | null;
+function openCredits(): void {
+  if (!creditsModal) return;
+  creditsModal.classList.add('shown');
+  creditsModal.setAttribute('aria-hidden', 'false');
+}
+function closeCredits(): void {
+  if (!creditsModal) return;
+  creditsModal.classList.remove('shown');
+  creditsModal.setAttribute('aria-hidden', 'true');
+}
+function isCreditsOpen(): boolean {
+  return !!creditsModal && creditsModal.classList.contains('shown');
+}
+if (creditsOpenBtn) creditsOpenBtn.addEventListener('click', openCredits);
+if (creditsClose) creditsClose.addEventListener('click', closeCredits);
+if (creditsVersion) creditsVersion.textContent = `Evoloom ${APP_VERSION}`;
 
 // ── Lab tabs (Editor / Dictionary) ────────────────────────────────────────
 const labTabs = document.querySelectorAll<HTMLButtonElement>('.lab-tab');
@@ -2014,7 +2744,7 @@ function freezeAndCapture(): void {
     pushHydroState();
   }
   quickSave();
-  logStatus('🧊 FREEZE — paused, all noise/hydrolysis off, quicksaved. Press F to resume + reload settings.');
+  logStatus('🧊 FREEZE — paused, all noise/hydrolysis off, quicksaved. Press Q to resume + reload settings.');
 }
 
 const loadFileInput = document.createElement('input');
@@ -2048,6 +2778,12 @@ function onLoadResult(msg: LoadResultMsg): void {
     statsRows.length = 0;
     updateCsvCount();
     if (typeof msg.seed === 'number') seedInput.value = String(msg.seed);
+    // The worker resets inGame on every load — exit the match UI too or
+    // the sandbox would show the game HUD over a world with no match.
+    if (gameMode) {
+      exitGameModeUI();
+      logStatus('Play mode OFF — world loaded');
+    }
     logStatus(`Loaded · iter ${(msg.iterations ?? 0).toLocaleString()} · ${(msg.cellCount ?? 0).toLocaleString()} atoms · sim resumed deterministically from saved RNG state`);
   } else {
     logStatus(`Load error: ${msg.error ?? 'unknown'}`);
@@ -2173,6 +2909,7 @@ function refreshNoiseLabels(): void {
   noiseBondVal.textContent  = fmtProb(sliderToProb(parseInt(noiseBondSlider.value)  || 0));
 }
 function toggleNoise(): void {
+  if (gameMode) return; // hazard toggles are suspended while a match runs
   // Auto-snapshot the pre-toggle state so a one-click rewind is available
   // if the toggle ruins something interesting.
   captureAutoSnapshot(noiseOn ? 'before-noise-off' : 'before-noise-on');
@@ -2321,6 +3058,7 @@ function refreshHydroLabels(): void {
   hydroDensityVal.textContent = hydroDensityFromSlider(parseInt(hydroDensitySlider.value) || 10).toFixed(4);
 }
 function toggleHydro(): void {
+  if (gameMode) return; // hazard toggles are suspended while a match runs
   captureAutoSnapshot(hydroOn ? 'before-hydro-off' : 'before-hydro-on');
   hydroOn = !hydroOn;
   hydroBtn.textContent = hydroOn ? '💧🧪 Hydrolysis: ON' : '💧🧪 Hydrolysis: OFF';
@@ -2520,10 +3258,16 @@ function toggleFullscreen(): void {
     body.classList.remove('canvas-fullscreen');
     if (fsToggle) fsToggle.textContent = '⛶';
   }
+  // The display box changes with the fullscreen class — let the internal
+  // resolution follow on layouts that track the display size, and move
+  // the docked HUD toggle with it.
+  requestAnimationFrame(() => { resizeCanvasToDisplay(); applyHudVisibility(); });
 }
 if (fsToggle) {
   fsToggle.addEventListener('click', toggleFullscreen);
 }
+const fsBtn = document.getElementById('fs-btn') as HTMLButtonElement | null;
+if (fsBtn) fsBtn.addEventListener('click', toggleFullscreen);
 // Sync the body class if user exits via Esc / native exit.
 document.addEventListener('fullscreenchange', () => {
   if (!document.fullscreenElement && document.body.classList.contains('canvas-fullscreen')) {
@@ -2542,16 +3286,30 @@ document.addEventListener('keydown', (e) => {
   // fire the soup brush — a real footgun in the previous version.
   const target = e.target as HTMLElement | null;
   const isTyping = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || (target as HTMLElement).isContentEditable);
-  const isShortcutKey = /^Key[A-Z]$|^Bracket(Left|Right)$/.test(e.code);
+  const isShortcutKey = /^Key[A-Z]$|^Comma$|^Period$/.test(e.code);
   if (isTyping && isShortcutKey) return;
 
-  // In game mode, WASD is reserved for the player. We still allow other shortcuts.
-  if (gameMode && (e.code === 'KeyW' || e.code === 'KeyA' || e.code === 'KeyS' || e.code === 'KeyD')) {
-    if (e.code === 'KeyW') keyState.w = true;
-    if (e.code === 'KeyA') keyState.a = true;
-    if (e.code === 'KeyS') keyState.s = true;
-    if (e.code === 'KeyD') keyState.d = true;
+  // In game mode, WASD/arrows are reserved for the player — arrows would
+  // otherwise scroll the page. Other shortcuts stay live.
+  const moveKey = MOVE_KEYS[e.code];
+  if (gameMode && moveKey) {
+    e.preventDefault();
+    keyState[moveKey] = true;
     pushPlayerInput();
+    return;
+  }
+  // Enter on the first-visit intro means "start game".
+  if (e.code === 'Enter' && overlayShownStatus === 3) {
+    e.preventDefault();
+    dismissIntro();
+    if (!gameMode) toggleGame();
+    return;
+  }
+  // Enter on the end-of-match overlay restarts immediately — the
+  // overlay's ↻ button advertises the same shortcut.
+  if (gameMode && e.code === 'Enter' && overlayShownStatus !== 0) {
+    e.preventDefault();
+    restartMatch();
     return;
   }
   // Esc: pending bond → lab → inspector → panel → reset brush.
@@ -2561,6 +3319,7 @@ document.addEventListener('keydown', (e) => {
       setEditorStatus('Bond gesture cancelled.');
       return;
     }
+    if (isCreditsOpen()) { closeCredits(); return; }
     if (isLabOpen()) { closeLab(); return; }
     if (isInspectorOpen()) { closeInspector(); return; }
     if (isPanelOpen()) { closePanel(); return; }
@@ -2573,15 +3332,17 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'KeyR')  { toggleRecording(); }
   if (e.code === 'KeyB')  { setBrush('soup'); }
   if (e.code === 'KeyW')  { setBrush('water'); }
+  if (e.code === 'KeyS')  { setBrush('select'); }
   if (e.code === 'KeyC')  { clearWater(); }
   if (e.code === 'KeyV')  { toggleView(); }
   if (e.code === 'KeyG')  { toggleGame(); }
   if (e.code === 'KeyN')  { toggleNoise(); }
   if (e.code === 'KeyH')  { toggleHydro(); }
   if (e.code === 'KeyM')  { e.preventDefault(); togglePanel(); }
-  if (e.code === 'BracketLeft')  { e.preventDefault(); quickSave(); }
-  if (e.code === 'BracketRight') { e.preventDefault(); quickLoad(); }
-  if (e.code === 'KeyF')         { e.preventDefault(); freezeAndCapture(); }
+  if (e.code === 'Comma')        { e.preventDefault(); quickSave(); }
+  if (e.code === 'Period')       { e.preventDefault(); quickLoad(); }
+  if (e.code === 'KeyF')         { e.preventDefault(); setFollow(!followIds); }
+  if (e.code === 'KeyQ')         { e.preventDefault(); freezeAndCapture(); }
   if ((e.code === 'Delete' || e.code === 'Backspace') && brushMode === 'select') {
     e.preventDefault();
     send({ type: 'deleteSelected' });
@@ -2590,25 +3351,169 @@ document.addEventListener('keydown', (e) => {
 });
 document.addEventListener('keyup', (e) => {
   if (!gameMode) return;
-  if (e.code === 'KeyW') { keyState.w = false; pushPlayerInput(); }
-  if (e.code === 'KeyA') { keyState.a = false; pushPlayerInput(); }
-  if (e.code === 'KeyS') { keyState.s = false; pushPlayerInput(); }
-  if (e.code === 'KeyD') { keyState.d = false; pushPlayerInput(); }
+  const moveKey = MOVE_KEYS[e.code];
+  if (moveKey) { keyState[moveKey] = false; pushPlayerInput(); }
 });
 
+// ── Interactive tutorial ────────────────────────────────────────────────────
+// Thin adapters over the existing toggles — tutorial.ts stays free of UI
+// internals, and setBrush/setPaused/setLysin get idempotent semantics here.
+const tutorialBtn  = document.getElementById('tutorial-btn');
+const tutorialBtn2 = document.getElementById('tutorial-btn2');
+function launchTutorial(): void {
+  startTutorial({
+    send,
+    logStatus,
+    isPanelOpen,
+    openPanel,
+    closePanel,
+    setBrush: (b) => { if (brushMode !== b) setBrush(b); },
+    setPaused: (p) => { if (p !== paused) togglePause(); },
+    isPaused: () => paused,
+    openInspector,
+    closeInspector,
+    isInspectorOpen,
+    isLabOpen,
+    closeLab,
+    isDictionaryOpen,
+    viewCenterWorld: () => {
+      const rect = canvas.getBoundingClientRect();
+      return screenToWorld(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    },
+    getBrush: () => brushMode,
+    // Slide the viewport ~35 % toward the nearest horizontal arena edge —
+    // used before scripted drops so pasted content lands in open space
+    // instead of on top of whatever the user was inspecting at center.
+    panTowardEdge: () => {
+      camSnap = null;
+      const vw = canvas.width / camera.zoom;
+      const cx = camera.x + vw / 2;
+      const dir = cx < GRID_W / 2 ? -1 : 1;
+      camera.x = Math.max(0, Math.min(GRID_W - vw, camera.x + dir * vw * 0.35));
+    },
+    focusOn: (x, y, r) => focusOn(x, y, r),
+    setFollow: (on) => setFollow(on),
+    isFollowing: () => followIds !== null,
+    setRate: (f) => {
+      simRate = Math.max(0, Math.min(1, f));
+      speedSlider.value = String(Math.round(simRate * 100));
+      speedVal.textContent = speedSlider.value + '%';
+      send({ type: 'setSimRate', v: simRate });
+    },
+    getRate: () => simRate,
+    setLysin: (on) => { if (on !== lysinActive) toggleLysin(); },
+    isGameMode: () => gameMode,
+    toggleGame,
+  });
+}
+if (tutorialBtn) tutorialBtn.addEventListener('click', launchTutorial);
+if (tutorialBtn2) tutorialBtn2.addEventListener('click', launchTutorial);
+
 // ── Render loop ─────────────────────────────────────────────────────────────
+// In game mode the top-left HUD swaps the sandbox stats for match state:
+// enemies left, own cells/size and how close the win/lose timers are.
+function drawHud(ctx: CanvasRenderingContext2D, snap: SnapshotMsg): void {
+  if (gameMode) {
+    drawGameHUD2D(ctx, snap.atoms, snap.atomCount, {
+      playerCells: snap.playerCount,
+      enemyCells: snap.enemyCount,
+      membraneFrac: snap.playerMembraneFrac,
+      itersPerSec: snap.itersPerSec,
+      winIters: snap.winCountdownIter,
+      loseIters: snap.loseCountdownIter,
+      gameStatus: snap.gameStatus,
+      fireIters: snap.fireCooldownIter,
+      dartCount: snap.projectileCount,
+      ammo: snap.lysinAmmo,
+      homingOn: snap.homingOn,
+      damageFlash: Math.max(0, 1 - (performance.now() - lastBiteAt) / 400),
+    });
+  } else {
+    drawHUD2D(ctx, snap.iterations, snap.atomCount, snap.atoms);
+  }
+}
+
 function loop(): void {
+  snapTick();
   const snap = lastSnapshot;
   if (snap) {
+    // Pending game-start arm: as soon as the pre-selected player atom
+    // shows up in a snapshot, capture it for camera follow.
+    if (armFollowOnSelection && followIds === null) {
+      for (let i = 0; i < snap.atomCount; i++) {
+        if (((snap.atoms[i * STRIDE + 3] | 0) & 16) !== 0) {
+          setFollow(true);
+          armFollowOnSelection = false;
+          break;
+        }
+      }
+    }
+    if (followIds) followTick(snap);
+    if (gameMode && steerTarget) pushSteerInput();
     if (gameMode) {
       if (snap.gameStatus === 1 || snap.gameStatus === 2) showGameOverlay(snap.gameStatus);
       else hideGameOverlay();
+      // Dart reload mirror for the fire pad — updated unconditionally
+      // (drawHud only runs in educational view with the HUD visible).
+      lastFireCooldownIter = snap.fireCooldownIter;
+      firePad?.style.setProperty('--cd', snap.fireCooldownFrac.toFixed(3));
+      firePad?.classList.toggle('empty', snap.lysinAmmo < 5);
+      // Homing unlock — rising edge only; a fresh match clears the flag
+      // worker-side, which resets this mirror automatically.
+      if (snap.homingOn && !homingSeen) {
+        logStatus('◎ homing guidance online — lysoviruses now curve toward enemies');
+      }
+      homingSeen = snap.homingOn;
+      // Enemy bearing tick — same angle convention as the aim needle
+      // (0deg = up), so a press aligned with the tick fires at the
+      // nearest enemy.
+      if (fireEnemy) {
+        if (snap.enemyDist > 0) {
+          fireEnemy.classList.add('shown');
+          fireEnemy.dataset.dist = snap.enemyDist.toFixed(0);
+          // Proximity pulse — the tick blinks faster as the threat closes.
+          fireEnemy.classList.toggle('close', snap.enemyDist < 220);
+          const deg = Math.atan2(snap.enemyDirY, snap.enemyDirX) * 180 / Math.PI + 90;
+          fireEnemy.style.transform = `rotate(${deg}deg)`;
+        } else {
+          fireEnemy.classList.remove('shown', 'close');
+          delete fireEnemy.dataset.dist;
+        }
+      }
+      if (fireLysin) {
+        if (snap.lysinDist > 0) {
+          fireLysin.classList.add('shown');
+          const deg = Math.atan2(snap.lysinDirY, snap.lysinDirX) * 180 / Math.PI + 90;
+          fireLysin.style.transform = `rotate(${deg}deg)`;
+        } else {
+          fireLysin.classList.remove('shown');
+        }
+      }
+      // Kill feed — enemies replicate mid-match, so only a drop below
+      // the running minimum counts as a real loss; a bounce back down
+      // after a division is not a kill. Loop detection flickers during
+      // the first seconds of a match (a spawning cell can count as an
+      // extra loop for a frame), so the feed stays silent until the
+      // detector has settled.
+      if (snap.gameStatus === 0) {
+        if (performance.now() - matchStartAt > 2500) {
+          if (minEnemyCount < 0) minEnemyCount = snap.enemyCount;
+          else if (snap.enemyCount < minEnemyCount) {
+            minEnemyCount = snap.enemyCount;
+            logStatus(`☠ Enemy down — ${snap.enemyCount} left`);
+          }
+        }
+      } else {
+        minEnemyCount = -1; // match ended — the next one seeds fresh
+      }
+    } else if (minEnemyCount !== -1) {
+      minEnemyCount = -1;
     }
     if (viewMode === 'classic') {
       // Classic mode renders entirely onto the overlay canvas (which always
       // has a 2D context, regardless of whether main is WebGPU or 2D). The
       // overlay's opaque white fill covers whatever the main canvas last had.
-      draw2DClassic(overlayCtx, snap.atoms, snap.atomCount, snap.bonds, snap.droplets, camera);
+      draw2DClassic(overlayCtx, snap.atoms, snap.atomCount, snap.bonds, snap.droplets, camera, GRID_W, GRID_H);
       // Arena boundary — drawn last on top of the white classic surface.
       // Uses a darker variant so it reads on white. Camera transform is
       // already set by draw2DClassic.
@@ -2616,7 +3521,7 @@ function loop(): void {
       overlayCtx.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
       drawArenaBorder(overlayCtx, GRID_W, GRID_H, z);
     } else if (useGPU) {
-      drawGPU(snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
+      drawGPU(snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera, GRID_W, GRID_H);
       // Reset the overlay transform before clearing — clearRect honors the
       // current transform, so leftover camera scale from classic-mode would
       // cause it to clear only a tiny world-space rect and leave the rest
@@ -2631,19 +3536,25 @@ function loop(): void {
         drawArenaBorder(overlayCtx, GRID_W, GRID_H, z);
         overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
       }
-      if (viewMode === 'educational') drawHUD2D(overlayCtx, snap.iterations, snap.atomCount, snap.atoms);
+      if (viewMode === 'educational' && hudVisible) {
+        drawHud(overlayCtx, snap);
+        // The stats box width tracks its text — re-dock the toggle each
+        // frame so it stays pinned to the box's top-right corner.
+        positionHudToggle();
+      }
     } else if (ctx2d) {
-      draw2D(ctx2d, snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera);
+      draw2D(ctx2d, snap.atoms, snap.atomCount, snap.loops, snap.bonds, snap.droplets, bacteriaView, snap.epoch, camera, GRID_W, GRID_H);
       // Arena boundary on the 2D fallback canvas. Skipped in microscope.
       if (viewMode !== 'microscope') {
         const z = camera.zoom;
         ctx2d.setTransform(z, 0, 0, z, -camera.x * z, -camera.y * z);
         drawArenaBorder(ctx2d, GRID_W, GRID_H, z);
       }
-      if (viewMode === 'educational') {
+      if (viewMode === 'educational' && hudVisible) {
         // HUD always in screen space — reset transform first
         ctx2d.setTransform(1, 0, 0, 1, 0, 0);
-        drawHUD2D(ctx2d, snap.iterations, snap.atomCount, snap.atoms);
+        drawHud(ctx2d, snap);
+        positionHudToggle();
       }
     }
     // Selection halo — draws the yellow ring on whichever surface is
@@ -2653,8 +3564,6 @@ function loop(): void {
     // In-progress selection rectangle (drawn while the user is dragging).
     drawSelectionBox();
   }
-  // also keep stepsPerFrame in sync (so worker has it after init)
-  void stepsPerFrame;
   requestAnimationFrame(loop);
 }
 
@@ -2703,6 +3612,9 @@ function drawSelectionHalo(snap: SnapshotMsg): void {
       ? 'No selection · use the Select brush, then click any atom'
       : `${xs.length} atom${xs.length === 1 ? '' : 's'} selected · press I or click Open inspector`;
   }
+  // Follow needs a selection to capture; while a track is already live
+  // the button stays enabled so the user can release it.
+  if (followBtn) followBtn.disabled = xs.length === 0 && followIds === null;
   const microscope = viewMode === 'microscope';
   if (xs.length === 0) return;
 
@@ -2721,8 +3633,8 @@ function drawSelectionHalo(snap: SnapshotMsg): void {
   // cluster reads as a glowing constellation rather than a single dot.
   const t = (performance.now() / 1000) * 2 * Math.PI / 1.2;
   const pulse = 0.6 + 0.4 * (Math.sin(t) * 0.5 + 0.5);
-  ctx.lineWidth = Math.max(1.0, 2.5 / z);
-  ctx.strokeStyle = `rgba(255, 220, 60, ${pulse.toFixed(3)})`;
+  ctx.lineWidth = Math.max(0.6, 1.2 / z);
+  ctx.strokeStyle = `rgba(255, 220, 60, ${(pulse * 0.45).toFixed(3)})`;
   for (let i = 0; i < xs.length; i++) {
     ctx.beginPath();
     ctx.arc(xs[i], ys[i], 14, 0, Math.PI * 2);
@@ -2742,3 +3654,6 @@ function drawSelectionHalo(snap: SnapshotMsg): void {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
 }
 requestAnimationFrame(loop);
+// First visit only — the intro offers play mode vs. sandbox up front;
+// afterwards the overlay is reserved for match end states.
+if (!introSeen()) showIntroOverlay();

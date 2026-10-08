@@ -18,15 +18,16 @@ declare function setTimeout(handler: () => void, ms: number): number;
 declare const performance: { now(): number };
 
 import { Grid } from './grid';
-import { Cell } from './cell';
+import { Cell, RADIUS } from './cell';
 import { initSimple, buildCell, seedLysin, removeLysin, seedPredatorCells, removePredatorCells, seedSoup, Q } from './init';
+import { spawnDart, updateDarts, FIRE_COOLDOWN_TICKS, DART_ATOMS } from './dart';
 import { initWild, generateRandomChemistry, wildTick } from './wild';
 import {
   ControlMsg, SnapshotMsg, BurnProgressMsg, BurnDoneMsg,
   SaveState, SaveStateMsg, LoadResultMsg, EventLogChunkMsg, STRIDE,
   packTypeState, allocAtomsBuffer, allocAtomIdsBuffer, allocLoopsBuffer, allocBondsBuffer, allocDropletsBuffer,
   MAX_ATOMS, MAX_LOOP_VERTS_TOTAL, MAX_BONDS, MAX_DROPLETS,
-  CustomAtomDef, CustomRuleSpec,
+  CustomAtomDef, CustomRuleSpec, DART_AMMO_START, FireRejectedMsg, PlayerHitMsg, DartHitMsg,
 } from './snapshot';
 import { r2, r3 } from './reaction';
 import { NoiseConfig, EventLog, DEFAULT_NOISE } from './noise';
@@ -114,6 +115,15 @@ let mode: Mode = 'rigged';
 let gridW = 0;
 let gridH = 0;
 let stepsPerFrame = 8;
+const MAX_SPF = 30;
+// Seed near the old fixed default; the EWMA replaces it within a few ticks.
+let avgStepMs = 2;
+// Fraction of the auto-tuned rate the sim actually runs — 1 = full
+// throttle. Anything below 1 works at any density: it both shrinks
+// the per-tick step count and, when a single step already fills the
+// frame, stretches steps across ticks (true slow motion).
+let simRate = 1;
+let stepCarry = 0;
 let paused = false;
 let inGame = false;
 // Drip-feed (sandbox-mode passive replenishment) — same machinery as the
@@ -198,9 +208,57 @@ const WATER_RESPAWN_INTERVAL  = 4250;  // ticks between water drops + merge pass
 const LYSIN_RESPAWN_INTERVAL  = 10000; // ticks between lysin micro-spots
 const LYSIN_PER_SPOT          = 35;
 const WIN_NO_ENEMY_TICKS      = 2400;  // ~5 sec at default 480 steps/sec
+const LOSE_NO_PLAYER_TICKS    = 480;   // ~1 sec grace — a transient frame with no
+                                       // closed player loop is not a death
+// Lysin dart — the game-mode projectile fired from the fire pad
+// (spawn + lifecycle live in dart.ts, shared with dev/dart-sim.ts).
+const DART_AMMO_MAX        = 50;   // magazine cap — 10 darts
+// One flythrough of a lysin spot should bank roughly a dart's worth —
+// a radius that needs repeated tight passes makes the ammo loop the
+// bottleneck the fight probe measured (kill rate ~1 dart/45 s).
+const AMMO_PICKUP_RANGE    = RADIUS * 3.5;
+// Enemy pressure — membranes drift toward the player and grind its
+// ring on contact. A constant kick would be wrong here: bonded atoms
+// keep their velocity (bondedDamping = 1.0), so ANY persistent kick
+// accumulates to MAX_VELOCITY and every enemy zooms at full speed.
+// Instead each membrane atom's velocity blends toward a small pursuit
+// vector — an exponential approach to ENEMY_SEEK_SPEED that thermal
+// noise can't defeat and the player's steering can still outrun.
+const ENEMY_SEEK_SPEED     = 0.12;  // target drift toward the player (units/step)
+const ENEMY_SEEK_BLEND     = 0.003; // fraction of the velocity gap closed per step
+const BITE_CASES           = 120;
+const THREAT_TICK_MOD      = 10;   // bite-check cadence (iterations)
+// Grace after a successful bite — a breached ring can reseal via normal
+// chemistry if the player breaks contact, but only if the worker-side
+// bite rolls don't keep compounding the hole. Skips the whole bite
+// pass, not just the roll, for the window.
+const BITE_GRACE_TICKS     = 240;  // ~0.5 s at 480 it/s
+let lastBiteIter = -1e9;           // iteration of the last successful bite
 let gameStatus = 0;        // 0 playing, 1 won, 2 lost
 let noEnemyStartIter = -1; // -1 = enemies present; otherwise iteration when they vanished
+let noPlayerStartIter = -1; // same, for the player's loop
+// Sandbox hazard toggles suspended while a match runs — restored on endGame.
+let savedSandboxNoise = false;
+let savedSandboxHydro = false;
 let lastLoopCounts = { player: 0, enemy: 0 };
+let lastPlayerMembraneFrac = 0; // sealed share of player 'a' atoms, 0..1
+let lastFireIter = -1e9;      // iteration of the last fired dart (far past = ready)
+let lastDartCount = 0;        // dart atoms still under thrust in the last snapshot
+let lysinAmmo = 0;            // lysin atoms available for darts (5 per shot)
+// Terminal guidance is earned, not given: darts fly straight until the
+// first confirmed detonation proves the aim — from then on every dart
+// homes in on enemy membrane material (see updateDarts).
+let homingUnlocked = false;
+// Atoms belonging to ALIVE enemy loops — a closed membrane chain that
+// still carries both gene endpoints (e/f). Rebuilt by
+// findMembraneLoopsAndPack each snapshot; only these atoms may seek
+// the player, bite, and draw the red bearing tick. Broken membrane
+// scraps and empty husks are inert.
+const liveEnemyAtoms = new Set<Cell>();
+
+// Live dart clusters — the bonded lysin atoms of each shot in flight.
+// Emptied on world rebuilds and when a cluster detonates or burns out.
+const dartClusters: Cell[][] = [];
 
 // Buffer pool — three quintuplets so we never starve while one is rendered and
 // one is in transit. Main returns each used set via a 'reuse' message.
@@ -210,15 +268,25 @@ const loopsPool:    Uint32Array[]  = [allocLoopsBuffer(),    allocLoopsBuffer(),
 const bondsPool:    Uint32Array[]  = [allocBondsBuffer(),    allocBondsBuffer(),    allocBondsBuffer()];
 const dropletsPool: Float32Array[] = [allocDropletsBuffer(), allocDropletsBuffer(), allocDropletsBuffer()];
 
-// Drop a tight micro-cluster of lysin atoms at a single random spot. Used in
-// game mode to add scarce-but-deadly tools rather than blanket coverage.
+// Drop a tight micro-cluster of lysin atoms in the player's general
+// neighborhood — supply drops rather than arena lottery: a kiting
+// player can reach ammo without crossing the whole arena, but the
+// spot still lands at a risky offset (lysin eats the firing membrane
+// too). Used in game mode only.
 function spawnLysinSpot(): void {
-  const cx = gridW * (0.18 + Math.random() * 0.64);
-  const cy = gridH * (0.18 + Math.random() * 0.64);
+  let px = gridW / 2, py = gridH / 2, cnt = 0;
+  for (const c of grid.getCells()) {
+    if (c.playerControlled) { px += c.loc.x; py += c.loc.y; cnt++; }
+  }
+  if (cnt > 0) { px /= cnt; py /= cnt; }
+  const ang = Math.random() * Math.PI * 2;
+  const dist = 300 + Math.random() * 500;
+  const cx = Math.max(80, Math.min(gridW - 80, px + Math.cos(ang) * dist));
+  const cy = Math.max(80, Math.min(gridH - 80, py + Math.sin(ang) * dist));
   for (let n = 0; n < LYSIN_PER_SPOT; n++) {
-    const ang = Math.random() * Math.PI * 2;
+    const a = Math.random() * Math.PI * 2;
     const r = Math.sqrt(Math.random()) * 55;
-    grid.createCell(cx + Math.cos(ang) * r, cy + Math.sin(ang) * r, 'p', 0);
+    grid.createCell(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 'p', 0);
   }
 }
 
@@ -259,11 +327,22 @@ function spawnRandomSoupPatches(): void {
 
 function setupGame(): void {
   selectedSet.clear();
+  // A world rebuild kills any running burn — the grid it was
+  // fast-forwarding is gone and it must not step the new world.
+  burning = false;
   grid = new Grid();
   attachNoiseToGrid();
   grid.create(gridW, gridH);
   grid.getChemistry().clear();
   grid.energyEnabled = false;
+  // The match spawns its own hazards on a timer (lysin spots, respawning
+  // soup/water). Sandbox noise and hydrolysis toggles are suspended for
+  // the duration so leftover settings cannot add off-rule hazards —
+  // the droplets below stay empty water shells without water atoms.
+  savedSandboxNoise = noise.enabled;
+  savedSandboxHydro = hydrolysis.enabled;
+  noise.enabled = false;
+  hydrolysis.enabled = false;
   // Re-register the chemistry rules from initSimple, but pass NO cell centers
   // and NO background — we'll seed our own scattered world below.
   initSimple(grid, [], 0);
@@ -275,6 +354,9 @@ function setupGame(): void {
   for (let i = beforePlayer; i < afterPlayer; i++) {
     grid.getCells()[i].playerControlled = true;
   }
+  // Pre-select one player atom — the main thread reads the selected flag
+  // from the next snapshot and arms camera follow on the microbe.
+  selectedSet.add(grid.getCells()[beforePlayer]);
 
   // 5 opponent cells scattered around (avoiding the very center)
   for (let k = 0; k < 5; k++) {
@@ -316,8 +398,151 @@ function setupGame(): void {
   applyCustomChemistryToCurrentGrid();
 }
 
+// Fire a lysin dart — the game-mode projectile. A bonded cluster of 'p'
+// atoms gets a constant-direction thrust for a short burn, then drifts
+// as loose armed lysin. The cluster spawns just OUTSIDE the player's
+// membrane ring (spawn clearance > REACTION_RANGE) so the payload can
+// never dissolve the cell that fired it; steering back into your own
+// shot afterwards is a genuine, fair risk.
+function fireDart(dx: number, dy: number): void {
+  const mag = Math.hypot(dx, dy);
+  if (mag < 0.001) return;
+  if (!inGame || gameStatus !== 0) return;
+  if (grid.iterations - lastFireIter < FIRE_COOLDOWN_TICKS) {
+    console.log(`[WEAPON] fire rejected — ${FIRE_COOLDOWN_TICKS - (grid.iterations - lastFireIter)} iter cooldown left`);
+    const reject: FireRejectedMsg = { type: 'fireRejected', reason: 'cooldown' };
+    self.postMessage(reject);
+    return;
+  }
+  if (lysinAmmo < DART_ATOMS) {
+    console.log(`[WEAPON] fire rejected — out of lysin (${lysinAmmo} atoms, need ${DART_ATOMS}; fly through orange p-atoms to rearm)`);
+    const reject: FireRejectedMsg = { type: 'fireRejected', reason: 'ammo' };
+    self.postMessage(reject);
+    return;
+  }
+  const ux = dx / mag, uy = dy / mag;
+  // Centroid over BONDED player atoms only — torn-off membrane scraps
+  // keep the player flag and would skew both the center and the edge.
+  let cx = 0, cy = 0, cnt = 0;
+  for (const c of grid.getCells()) {
+    if (!c.playerControlled || c.bonds.size === 0) continue;
+    cx += c.loc.x; cy += c.loc.y; cnt++;
+  }
+  if (cnt === 0) { console.log('[WEAPON] fire rejected — no player atoms'); return; }
+  cx /= cnt; cy /= cnt;
+  // The membrane edge along the aim axis = the largest forward
+  // projection among atoms inside a corridor around the aim ray — an
+  // off-axis protrusion (or a far-flung scrap) must not push the spawn
+  // out. Corridor half-width covers the cluster's satellite radius.
+  let fireEdge = 0, corridorSeen = false;
+  for (const c of grid.getCells()) {
+    if (!c.playerControlled || c.bonds.size === 0) continue;
+    const fx = c.loc.x - cx, fy = c.loc.y - cy;
+    const perp = fx * -uy + fy * ux;
+    const proj = fx * ux + fy * uy;
+    if (Math.abs(perp) < RADIUS * 3.5) {
+      corridorSeen = true;
+      if (proj > fireEdge) fireEdge = proj;
+    }
+  }
+  if (!corridorSeen) {
+    // Degenerate ring (sideways sliver): fall back to the widest
+    // projection so the shot still clears the membrane.
+    for (const c of grid.getCells()) {
+      if (!c.playerControlled || c.bonds.size === 0) continue;
+      const p = (c.loc.x - cx) * ux + (c.loc.y - cy) * uy;
+      if (p > fireEdge) fireEdge = p;
+    }
+  }
+  const { cluster, x: px, y: py } = spawnDart(grid, cx, cy, fireEdge, ux, uy, grid.iterations);
+  lastFireIter = grid.iterations;
+  lysinAmmo -= DART_ATOMS;
+  dartClusters.push(cluster);
+  console.log(`[WEAPON] lysovirus fired dir(${ux.toFixed(2)},${uy.toFixed(2)}) at (${px.toFixed(0)},${py.toFixed(0)}) — ${cluster.length} lysin atoms, ammo ${lysinAmmo}, edge ${fireEdge.toFixed(0)}`);
+}
+
+// Lysin pickup — free 'p' atoms touching the player's cell are absorbed
+// into the dart magazine. Armed dart atoms in flight are excluded;
+// spent/loose lysin (including a missed shot's payload) is collectable.
+// Ambient lysin still dissolves membrane on contact, so scooping a spot
+// is a genuine risk/reward trade rather than a free rearm.
+function collectLysinAmmo(): void {
+  if (lysinAmmo >= DART_AMMO_MAX) return;
+  const picked = new Set<Cell>();
+  for (const c of grid.getCells()) {
+    if (!c.playerControlled) continue;
+    for (const n of grid.getAllWithinRadius(c.loc.x, c.loc.y, AMMO_PICKUP_RANGE)) {
+      if (n.type === 'p' && n.bonds.size === 0 && n.thrustUntilIter <= grid.iterations) {
+        picked.add(n);
+      }
+    }
+  }
+  for (const n of picked) {
+    if (lysinAmmo >= DART_AMMO_MAX) break;
+    grid.removeCell(n);
+    lysinAmmo++;
+  }
+  if (picked.size > 0) {
+    console.log(`[WEAPON] lysin collected — +${picked.size} atoms, ammo ${lysinAmmo}`);
+  }
+}
+
+// Enemy seek — enemy membrane atoms blend their velocity toward a slow
+// pursuit vector pointing at the player centroid, so cells creep toward
+// the player instead of waiting to be hunted. Runs every iteration.
+function updateEnemySeek(): void {
+  let cx = 0, cy = 0, cnt = 0;
+  for (const c of grid.getCells()) {
+    if (!c.playerControlled) continue;
+    cx += c.loc.x; cy += c.loc.y; cnt++;
+  }
+  if (cnt === 0) return;
+  cx /= cnt; cy /= cnt;
+  for (const c of grid.getCells()) {
+    if (c.type !== 'a' || c.playerControlled || !liveEnemyAtoms.has(c)) continue;
+    const dx = cx - c.loc.x, dy = cy - c.loc.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 1) continue;
+    const tx = (dx / d) * ENEMY_SEEK_SPEED, ty = (dy / d) * ENEMY_SEEK_SPEED;
+    c.vel.x += (tx - c.vel.x) * ENEMY_SEEK_BLEND;
+    c.vel.y += (ty - c.vel.y) * ENEMY_SEEK_BLEND;
+  }
+}
+
+// Contact damage — a player membrane atom with a bonded enemy atom in
+// reach rolls a bite that can snap one bond in the ring: the same
+// breach lysin causes, just from cell contact. Fixed cadence, and a
+// grace window after each successful bite so breaking contact can pay
+// off before the next breach lands.
+function updateEnemyThreat(): void {
+  if (grid.iterations - lastBiteIter < BITE_GRACE_TICKS) return;
+  for (const c of grid.getCells()) {
+    if (c.type !== 'a' || !c.playerControlled || c.bonds.size === 0) continue;
+    const near = grid.getAllWithinRadius(c.loc.x, c.loc.y, RADIUS * 2.5);
+    let enemyNear = false;
+    for (const n of near) {
+      if (n.type === 'a' && !n.playerControlled && liveEnemyAtoms.has(n)) { enemyNear = true; break; }
+    }
+    if (!enemyNear) continue;
+    for (const partner of c.bonds) {
+      if (partner.type === 'a' && Math.random() * BITE_CASES < 1) {
+        c.debond(partner);
+        partner.state = 0; // freed back to soup, as with lysin
+        lastBiteIter = grid.iterations;
+        console.log(`[GAME] enemy bite — membrane breached at (${c.loc.x.toFixed(0)},${c.loc.y.toFixed(0)}) iter ${grid.iterations}`);
+        const hit: PlayerHitMsg = { type: 'playerHit' };
+        self.postMessage(hit);
+        break;
+      }
+    }
+  }
+}
+
 function setupRigged(): void {
   selectedSet.clear();
+  // A world rebuild kills any running burn — the grid it was
+  // fast-forwarding is gone and it must not step the new world.
+  burning = false;
   grid = new Grid();
   attachNoiseToGrid();
   grid.create(gridW, gridH);
@@ -339,6 +564,9 @@ function setupRigged(): void {
 
 function setupWild(): void {
   selectedSet.clear();
+  // A world rebuild kills any running burn — the grid it was
+  // fast-forwarding is gone and it must not step the new world.
+  burning = false;
   grid = new Grid();
   attachNoiseToGrid();
   grid.create(gridW, gridH);
@@ -350,13 +578,15 @@ function setupWild(): void {
 // Runs in the worker so the main thread never has to traverse the bond graph.
 type LoopInfo = { vertCount: number; isPredator: boolean; firstVertOffset: number };
 
-function findMembraneLoopsAndPack(cells: Cell[], indexMap: Map<Cell, number>, loopsBuf: Uint32Array): { loopCount: number; usedLen: number; playerLoops: number; enemyLoops: number } {
+function findMembraneLoopsAndPack(cells: Cell[], indexMap: Map<Cell, number>, loopsBuf: Uint32Array): { loopCount: number; usedLen: number; playerLoops: number; enemyLoops: number; playerMembraneFrac: number } {
   const visited = new Set<Cell>();
+  liveEnemyAtoms.clear();
   const headers: LoopInfo[] = [];
   let writeIdx = 1;
   let totalVerts = 0;
   let playerLoops = 0;
   let enemyLoops  = 0;
+  let sealedPlayerMembrane = 0;
 
   for (const start of cells) {
     if (start.type !== 'a' || visited.has(start)) continue;
@@ -435,13 +665,33 @@ function findMembraneLoopsAndPack(cells: Cell[], indexMap: Map<Cell, number>, lo
         if (hasE && hasF) break;
       }
       if (hasE && hasF) {
-        if (kind === 2) playerLoops++; else enemyLoops++;
+        if (kind === 2) playerLoops++;
+        else {
+          enemyLoops++;
+          for (const c of chain) liveEnemyAtoms.add(c);
+        }
       }
+      if (kind === 2) sealedPlayerMembrane += chain.length;
     }
   }
 
+  // Membrane integrity for the game HUD: every player-controlled 'a' atom is
+  // membrane material — atoms torn free by predators/lysin keep the flag
+  // until absorbed elsewhere, so the sealed fraction reads 1.0 while the
+  // ring is intact and drops as the cell is breached.
+  let playerMembraneAtoms = 0;
+  for (const c of cells) {
+    if (c.type === 'a' && c.playerControlled) playerMembraneAtoms++;
+  }
+
   loopsBuf[0] = headers.length;
-  return { loopCount: headers.length, usedLen: writeIdx, playerLoops, enemyLoops };
+  return {
+    loopCount: headers.length,
+    usedLen: writeIdx,
+    playerLoops,
+    enemyLoops,
+    playerMembraneFrac: playerMembraneAtoms > 0 ? sealedPlayerMembrane / playerMembraneAtoms : 0,
+  };
 }
 
 // Real surface tension fuses droplets the moment they touch. We loop until
@@ -495,6 +745,7 @@ function packSnapshot(atomsBuf: Float32Array, atomIdsBuf: Uint32Array, loopsBuf:
   const indexMap = new Map<Cell, number>();
   for (let i = 0; i < n; i++) indexMap.set(cells[i], i);
 
+  let dartAtoms = 0;
   for (let i = 0; i < n; i++) {
     const c = cells[i];
     const o = i * STRIDE;
@@ -509,23 +760,34 @@ function packSnapshot(atomsBuf: Float32Array, atomIdsBuf: Uint32Array, loopsBuf:
     if (c.type === 'a') flags |= 4;
     if (c.playerControlled) flags |= 8;
     if (selectedSet.has(c)) flags |= 16; // bit 4 = selected, drives the halo on the main thread
+    const thrusting = c.thrustUntilIter > grid.iterations;
+    if (thrusting) flags |= 32; // bit 5 = propelled dart atom — rendered as a glowing tracer
     atomsBuf[o + 3] = flags;
     atomIdsBuf[i] = c.id >>> 0;
+    if (thrusting) dartAtoms++;
   }
+  lastDartCount = dartAtoms;
   // Zero unused tail so main can't see stale IDs from a prior snapshot.
   if (n < atomIdsBuf.length) atomIdsBuf.fill(0, n);
 
   const loopRes = findMembraneLoopsAndPack(cells, indexMap, loopsBuf);
   lastLoopCounts.player = loopRes.playerLoops;
   lastLoopCounts.enemy  = loopRes.enemyLoops;
+  lastPlayerMembraneFrac = loopRes.playerMembraneFrac;
   if (inGame && gameStatus === 0) {
     if (loopRes.playerLoops === 0) {
-      gameStatus = 2; // lose
-    } else if (loopRes.enemyLoops === 0) {
-      if (noEnemyStartIter < 0) noEnemyStartIter = grid.iterations;
-      if (grid.iterations - noEnemyStartIter >= WIN_NO_ENEMY_TICKS) gameStatus = 1;
+      // Grace window mirrors the win path: membranes open transiently while
+      // dividing or reshaping, so only a sustained loss counts as a death.
+      if (noPlayerStartIter < 0) noPlayerStartIter = grid.iterations;
+      if (grid.iterations - noPlayerStartIter >= LOSE_NO_PLAYER_TICKS) gameStatus = 2; // lose
     } else {
-      noEnemyStartIter = -1;
+      noPlayerStartIter = -1;
+      if (loopRes.enemyLoops === 0) {
+        if (noEnemyStartIter < 0) noEnemyStartIter = grid.iterations;
+        if (grid.iterations - noEnemyStartIter >= WIN_NO_ENEMY_TICKS) gameStatus = 1;
+      } else {
+        noEnemyStartIter = -1;
+      }
     }
   }
 
@@ -570,6 +832,53 @@ function postSnapshot(): void {
   const winCountdown = (inGame && noEnemyStartIter >= 0)
     ? Math.max(0, WIN_NO_ENEMY_TICKS - (grid.iterations - noEnemyStartIter))
     : 0;
+  const loseCountdown = (inGame && noPlayerStartIter >= 0)
+    ? Math.max(0, LOSE_NO_PLAYER_TICKS - (grid.iterations - noPlayerStartIter))
+    : 0;
+  // Lysin dart reload state + in-flight atom count for the fire pad/HUD.
+  const fireCooldown = inGame
+    ? Math.max(0, FIRE_COOLDOWN_TICKS - (grid.iterations - lastFireIter))
+    : 0;
+  // Bearings for the fire-pad compass: red tick to the nearest enemy
+  // membrane atom, amber tick to the nearest free lysin atom (spent
+  // dart payloads and supply spots both count — armed darts don't).
+  let enemyDirX = 0, enemyDirY = 0, enemyDist = 0;
+  let lysinDirX = 0, lysinDirY = 0, lysinDist = 0;
+  if (inGame && gameStatus === 0) {
+    let pcx = 0, pcy = 0, pcnt = 0;
+    for (const c of grid.getCells()) {
+      if (c.playerControlled) { pcx += c.loc.x; pcy += c.loc.y; pcnt++; }
+    }
+    if (pcnt > 0) {
+      pcx /= pcnt; pcy /= pcnt;
+      let best = Infinity, bx = 0, by = 0;
+      let bestP = Infinity, px = 0, py = 0;
+      for (const c of grid.getCells()) {
+        const dx = c.loc.x - pcx, dy = c.loc.y - pcy;
+        const d = dx * dx + dy * dy;
+        if (c.type === 'a' && !c.playerControlled && liveEnemyAtoms.has(c)) {
+          if (d < best) { best = d; bx = dx; by = dy; }
+        } else if (c.type === 'p' && c.bonds.size === 0 && c.thrustUntilIter <= grid.iterations) {
+          if (d < bestP) { bestP = d; px = dx; py = dy; }
+        }
+      }
+      if (best < Infinity) {
+        enemyDist = Math.sqrt(best);
+        enemyDirX = bx / enemyDist;
+        enemyDirY = by / enemyDist;
+      }
+      if (bestP < Infinity) {
+        lysinDist = Math.sqrt(bestP);
+        lysinDirX = px / lysinDist;
+        lysinDirY = py / lysinDist;
+      }
+      // Threat telemetry — approach speed tuning lives or dies by this
+      // number, so it stays visible in the console while a match runs.
+      if (grid.iterations % 1200 === 0) {
+        console.log(`[GAME] nearest enemy ${enemyDist > 0 ? enemyDist.toFixed(0) : '—'} units · lysin ${lysinDist > 0 ? lysinDist.toFixed(0) : '—'}`);
+      }
+    }
+  }
   const msg: SnapshotMsg = {
     type: 'snapshot',
     iterations: grid.iterations,
@@ -584,6 +893,24 @@ function postSnapshot(): void {
     playerCount: lastLoopCounts.player,
     enemyCount:  lastLoopCounts.enemy,
     winCountdownIter: winCountdown,
+    loseCountdownIter: loseCountdown,
+    playerMembraneFrac: lastPlayerMembraneFrac,
+    // Effective iteration rate right now: ticks/s × steps/tick × the
+    // rate limiter. Adaptive pacing and the speed slider move it
+    // between ~60 × 1 × 0.05 and 60 × MAX_SPF × 1, so the HUD converts
+    // the iteration countdowns with this value, not a fixed constant.
+    itersPerSec: TARGET_HZ * stepsPerFrame * simRate,
+    fireCooldownIter: fireCooldown,
+    fireCooldownFrac: fireCooldown / FIRE_COOLDOWN_TICKS,
+    projectileCount: lastDartCount,
+    lysinAmmo,
+    homingOn: homingUnlocked,
+    enemyDirX,
+    enemyDirY,
+    enemyDist,
+    lysinDirX,
+    lysinDirY,
+    lysinDist,
   };
   self.postMessage(msg, [
     atoms.buffer as Transferable,
@@ -697,7 +1024,11 @@ function loadSaveState(s: SaveState): string | null {
     cell.vel.x = s.cellVx[i];
     cell.vel.y = s.cellVy[i];
     cell.energy = s.cellEnergy[i];
-    cell.playerControlled = !!s.cellPlayer[i];
+    // Player ownership is never restored: a load ends the match on
+    // both threads (inGame is reset below; the main thread leaves the
+    // game UI on loadResult), so tinted cells would have no match
+    // owning them.
+    cell.playerControlled = false;
     newCells.push(cell);
   }
   // Bump nextAtomId past the highest restored ID (or use the saved counter
@@ -742,6 +1073,13 @@ function loadSaveState(s: SaveState): string | null {
   inGame = false;
   gameStatus = 0;
   noEnemyStartIter = -1;
+  noPlayerStartIter = -1;
+  lastFireIter = -1e9;
+  lastDartCount = 0;
+  lysinAmmo = 0;
+  lastBiteIter = -1e9;
+  homingUnlocked = false;
+  dartClusters.length = 0;
   burning = false;
   burnTarget = 0;
   selectedSet.clear();
@@ -766,36 +1104,44 @@ function yieldToQueue(): Promise<void> {
 }
 
 // Headless burn loop. Runs grid.step() as fast as the worker can manage,
-// emits progress every ~250ms, yields to the message queue between chunks
-// so abort/paint/etc. continue to work, and posts a final snapshot when
-// done so the main thread sees the new state.
+// emits progress every ~250ms of wall time, yields to the message queue
+// on the same budget so abort/paint/etc. stay responsive even when a
+// single chunk takes many seconds, and posts a final snapshot when done
+// so the main thread sees the new state.
 async function burnLoop(): Promise<void> {
   burning = true;
   let aborted = false;
   let lastProgressT  = performance.now();
   let lastProgressIt = grid.iterations;
-  // Chunk size = how many steps before we yield. Bigger = faster (less yield
-  // overhead) but slower abort response. 5000 ≈ 1-2 seconds of work at peak,
-  // which keeps abort latency tolerable.
+  // Chunk size = max steps before a mandatory yield. Bigger = faster
+  // (less yield overhead). Progress and queue drains additionally run
+  // on a 250ms wall-clock budget inside the chunk, so slow steps never
+  // leave the UI without feedback or the Cancel button unresponsive.
   const CHUNK = 5000;
 
   while (burning && grid.iterations < burnTarget) {
     const stopAt = Math.min(burnTarget, grid.iterations + CHUNK);
-    while (grid.iterations < stopAt) runOneStep();
-
-    const now = performance.now();
-    if (now - lastProgressT > 250) {
-      const dIt = grid.iterations - lastProgressIt;
-      const dT  = (now - lastProgressT) / 1000;
-      const progress: BurnProgressMsg = {
-        type: 'burnProgress',
-        iterations: grid.iterations,
-        target: burnTarget,
-        stepsPerSec: dT > 0 ? Math.round(dIt / dT) : 0,
-      };
-      self.postMessage(progress);
-      lastProgressT  = now;
-      lastProgressIt = grid.iterations;
+    // `burning` is also checked inside the chunk: a world rebuild (reset,
+    // reseed, mode change, save load, game start/end) drops it mid-step
+    // and the loop must not keep stepping the freshly built grid.
+    while (burning && grid.iterations < stopAt) {
+      runOneStep();
+      const now = performance.now();
+      if (now - lastProgressT > 250) {
+        const dIt = grid.iterations - lastProgressIt;
+        const dT  = (now - lastProgressT) / 1000;
+        const progress: BurnProgressMsg = {
+          type: 'burnProgress',
+          iterations: grid.iterations,
+          target: burnTarget,
+          stepsPerSec: dT > 0 ? Math.round(dIt / dT) : 0,
+        };
+        self.postMessage(progress);
+        lastProgressT  = now;
+        lastProgressIt = grid.iterations;
+        await yieldToQueue();
+        if (!burning) break;
+      }
     }
     // Yield so abortBurn / paintSoup / paintWater / clearWater can run.
     await yieldToQueue();
@@ -812,7 +1158,7 @@ async function burnLoop(): Promise<void> {
     aborted,
   };
   self.postMessage(done);
-  tick();
+  scheduleTick();
 }
 
 // One physics step plus all per-step side-effects (mode-specific tick,
@@ -822,6 +1168,23 @@ async function burnLoop(): Promise<void> {
 function runOneStep(): void {
   grid.step();
   if (mode === 'wild') wildTick(grid);
+  if (inGame && dartClusters.length > 0) {
+    const hit = updateDarts(grid, dartClusters, grid.iterations, homingUnlocked);
+    if (hit) {
+      console.log(`[WEAPON] lysovirus detonated at (${hit.loc.x.toFixed(0)},${hit.loc.y.toFixed(0)}) iter ${grid.iterations}`);
+      if (!homingUnlocked) {
+        homingUnlocked = true;
+        console.log('[WEAPON] homing guidance online — subsequent lysoviruses curve toward enemy membranes');
+      }
+      const msg: DartHitMsg = { type: 'dartHit' };
+      self.postMessage(msg);
+    }
+  }
+  if (inGame && gameStatus === 0) {
+    if (grid.iterations % 5 === 0) collectLysinAmmo();
+    updateEnemySeek();
+    if (grid.iterations % THREAT_TICK_MOD === 0) updateEnemyThreat();
+  }
   if (grid.iterations > 0) {
     if (inGame && gameStatus === 0) {
       if (grid.iterations % SOUP_RESPAWN_INTERVAL  === 0) spawnRandomSoupPatches();
@@ -834,11 +1197,34 @@ function runOneStep(): void {
   }
 }
 
+// The tick chain re-arms itself inside tick(); external starters (init,
+// burn finish) go through scheduleTick so a second chain can never be
+// armed — two parallel chains would double the simulation speed.
+let tickTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleTick(delay = 0): void {
+  if (tickTimer !== null) return;
+  tickTimer = setTimeout(() => { tickTimer = null; tick(); }, delay);
+}
+
 function tick(): void {
   if (burning) return; // burn loop owns the worker; tick will be re-armed when burn finishes
   const now = performance.now();
   if (!paused && gridW > 0) {
-    for (let i = 0; i < stepsPerFrame; i++) runOneStep();
+    stepCarry += stepsPerFrame * simRate;
+    const n = Math.floor(stepCarry);
+    stepCarry -= n;
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) runOneStep();
+    if (n > 0) {
+      // Adapt the step count to the measured per-step cost so the step
+      // loop stays inside one frame budget: dense worlds drop to a
+      // single step per frame (steady frame rate instead of a
+      // slideshow), light worlds scale up to MAX_SPF (free
+      // fast-forward). Total throughput is physics-bound either way —
+      // only the render cadence changes.
+      avgStepMs = avgStepMs * 0.8 + ((performance.now() - t0) / n) * 0.2;
+      stepsPerFrame = Math.max(1, Math.min(MAX_SPF, Math.floor(TARGET_DT_MS / Math.max(0.05, avgStepMs))));
+    }
     postSnapshot();
   }
   // Schedule the next tick relative to the *target* cadence. If physics took
@@ -852,7 +1238,7 @@ function tick(): void {
   if (delay === 0 && performance.now() - nextTickAt > TARGET_DT_MS * 4) {
     nextTickAt = performance.now();
   }
-  setTimeout(tick, delay);
+  tickTimer = setTimeout(() => { tickTimer = null; tick(); }, delay);
 }
 
 // ── Control message handler ───────────────────────────────────────────────
@@ -867,7 +1253,7 @@ self.onmessage = (e: MessageEvent<unknown>) => {
       // before setup so the initial layout is deterministic for that seed.
       seedRNG(_seed);
       if (mode === 'rigged') setupRigged(); else setupWild();
-      tick();
+      scheduleTick();
       return;
     case 'setSeed':
       // Re-seed AND restart the rigged setup so the new seed actually drives
@@ -894,6 +1280,9 @@ self.onmessage = (e: MessageEvent<unknown>) => {
       return;
     case 'setStepsPerFrame':
       stepsPerFrame = msg.n;
+      return;
+    case 'setSimRate':
+      simRate = Math.max(0, Math.min(1, msg.v));
       return;
     case 'setThermalScale':
       grid.thermalScale = msg.v;
@@ -962,17 +1351,33 @@ self.onmessage = (e: MessageEvent<unknown>) => {
       inGame = true;
       gameStatus = 0;
       noEnemyStartIter = -1;
+      noPlayerStartIter = -1;
+      lastFireIter = -1e9;
+      lastDartCount = 0;
+      lysinAmmo = DART_AMMO_START;
+      lastBiteIter = -1e9;
+      homingUnlocked = false;
+      dartClusters.length = 0;
       setupGame();
+      postSnapshotIfPaused();
       return;
     case 'endGame':
       inGame = false;
       gameStatus = 0;
       noEnemyStartIter = -1;
+      noPlayerStartIter = -1;
+      dartClusters.length = 0;
       setupRigged();
+      noise.enabled = savedSandboxNoise;
+      hydrolysis.enabled = savedSandboxHydro;
+      postSnapshotIfPaused();
       return;
     case 'setPlayerInput':
       grid.playerInputX = msg.x;
       grid.playerInputY = msg.y;
+      return;
+    case 'fire':
+      fireDart(msg.x, msg.y);
       return;
     case 'setDripFeed':
       dripFeed = msg.on;
@@ -981,15 +1386,19 @@ self.onmessage = (e: MessageEvent<unknown>) => {
       if (msg.waterInterval > 0) dripWaterInterval = msg.waterInterval;
       return;
     case 'burn':
-      // Ignore burn-while-burning; if user wants to extend, abort + restart.
+      // A burn arriving while one runs extends the target instead of
+      // being dropped — the loop still reaches burnDone, so the UI can
+      // never wait on a completion message that would never come (e.g.
+      // Start pressed again before the queue drained an abort).
+      burnTarget = Math.max(burning ? burnTarget : grid.iterations, msg.targetIters);
       if (burning) return;
-      burnTarget = Math.max(grid.iterations, msg.targetIters);
       // Kick off the async burn loop. It flips `burning = true` and tick()
       // self-suspends on its next firing (or it's already idle).
       void burnLoop();
       return;
     case 'abortBurn':
-      // Flips the loop guard; the loop notices on its next CHUNK boundary.
+      // Flips the loop guard; the loop notices at its next 250ms
+      // progress/yield point inside the current chunk.
       burning = false;
       return;
     case 'selectAt': {
@@ -1175,6 +1584,10 @@ self.onmessage = (e: MessageEvent<unknown>) => {
         const b = created[s.bonds[k + 1]];
         if (a && b) a.bondTo(b);
       }
+      // The pasted atoms become the selection — the halo shows where the
+      // drop landed and makes it inspectable/followable right away.
+      selectedSet.clear();
+      for (const c of created) selectedSet.add(c);
       postSnapshotIfPaused();
       return;
     }

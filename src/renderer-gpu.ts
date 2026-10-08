@@ -11,6 +11,7 @@
 
 import { RADIUS } from './cell';
 import { STRIDE, unpackType, unpackState } from './snapshot';
+import { ATOM_COLORS, FALLBACK_COLOR, MEMBRANE_LINE, PREDATOR_LINE, PREDATOR_UNIT, ALPHA, MARGIN } from './theme';
 
 // ── EMA smoothing (same constants as 2D renderer) ───────────────────────────
 const EMA_DEFAULT   = 0.28;
@@ -46,8 +47,6 @@ let _displayX = new Float32Array(0);
 let _displayY = new Float32Array(0);
 let _displayInit: Uint8Array = new Uint8Array(0);
 let _emaEpoch = -1;
-let _canvasW = 0;
-let _canvasH = 0;
 
 // Reusable CPU-side scratch
 const MAX_LOOP = 600;
@@ -102,6 +101,7 @@ struct Uniforms {
   view: u32, _pad0: u32,
   camera: vec2f,
   zoom: f32, _pad1: f32,
+  grid: vec2f, _pad2: vec2f,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 fn worldToClip(p: vec2f) -> vec2f {
@@ -119,6 +119,12 @@ const SHADER_BG = PRELUDE + `
   return vec4f(p[vi], 0., 1.);
 }
 @fragment fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+  // Outside the arena bounds the margin renders gray; the interior keeps
+  // the per-view backdrop.
+  let world = frag.xy / u.zoom + u.camera;
+  if (world.x < 0. || world.y < 0. || world.x > u.grid.x || world.y > u.grid.y) {
+    return vec4f(${MARGIN[0]}, ${MARGIN[1]}, ${MARGIN[2]}, 1.);
+  }
   if (u.view == 1u) {
     let cx = u.resolution * 0.5;
     let d  = distance(frag.xy, cx) / (max(u.resolution.x, u.resolution.y) * 0.6);
@@ -389,7 +395,7 @@ function buildPipelines(device: GPUDevice, format: GPUTextureFormat) {
 
 function buildBuffers(device: GPUDevice) {
   const uniformBuf = device.createBuffer({
-    size: 32, // resolution(8) + view+pad(8) + camera(8) + zoom+pad(8)
+    size: 48, // resolution(8) + view+pad(8) + camera(8) + zoom+pad(8) + grid+pad(16)
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   const particleBuf = device.createBuffer({
@@ -430,8 +436,6 @@ export async function initGPU(canvas: HTMLCanvasElement): Promise<boolean> {
   _format = format;
   _pipelines = buildPipelines(device, format);
   _buffers = buildBuffers(device);
-  _canvasW = canvas.width;
-  _canvasH = canvas.height;
   return true;
 }
 
@@ -506,6 +510,8 @@ export function drawGPU(
   bacteriaView: boolean,
   epoch: number,
   camera: GPUCamera,
+  gridW: number,
+  gridH: number,
 ): void {
   if (!_device || !_ctx || !_pipelines || !_buffers) return;
   const device = _device;
@@ -514,20 +520,35 @@ export function drawGPU(
   ensureDisplay(atomCount, epoch);
   smoothPositions(atoms, atomCount);
 
-  const view = ctx.getCurrentTexture().createView();
+  const tex = ctx.getCurrentTexture();
+  const view = tex.createView();
   const cmd = device.createCommandEncoder();
 
-  // Uniforms: resolution + view + camera + zoom (32 bytes)
-  const u = new ArrayBuffer(32);
+  // Uniforms: resolution + view + camera + zoom + grid bounds (48 bytes)
+  const u = new ArrayBuffer(48);
   const uF = new Float32Array(u);
   const uU = new Uint32Array(u);
-  uF[0] = _canvasW; uF[1] = _canvasH;
+  uF[0] = tex.width; uF[1] = tex.height;
   uU[2] = bacteriaView ? 1 : 0;
   // _pad0 at uU[3]
   uF[4] = camera.x; uF[5] = camera.y;
   uF[6] = camera.zoom;
   // _pad1 at uF[7]
+  uF[8] = gridW; uF[9] = gridH;
   device.queue.writeBuffer(_buffers.uniformBuf, 0, u);
+
+  // Build inLoop bit-vector early — the membrane-unit staging below needs
+  // it to distinguish closed loops from open chains.
+  const inLoop = new Uint8Array(atomCount);
+  {
+    let c2 = 1;
+    for (let li = 0; li < loops[0]; li++) {
+      const vc = loops[c2++];
+      c2 += 1; // kind
+      for (let i = 0; i < vc; i++) inLoop[loops[c2 + i]] = 1;
+      c2 += vc;
+    }
+  }
 
   // ── Stage soup particles + organelles ─────────────────────────────────────
   const r = RADIUS * 0.8;
@@ -537,11 +558,33 @@ export function drawGPU(
   for (let i = 0; i < atomCount; i++) {
     const o = i * STRIDE;
     const flags = atoms[o + 3] | 0;
-    const isMembrane = (flags & 4) !== 0;
-    if (isMembrane) continue;
+    // Membrane unit = bonded 'a' — flag 4 marks every 'a', free ones
+    // included; those belong to the soup pass (ALPHA.aFree).
+    const isMembrane = (flags & 4) !== 0 && (flags & 1) !== 0;
+    const px = _displayX[i], py = _displayY[i];
+    if (isMembrane) {
+      // Educational only: membrane 'a' atoms get full-size pale
+      // translucent circles so each unit is identifiable — closed loops
+      // stay faint (0.20), open chains more visible (0.60) so loose
+      // building material reads stronger than a finished wall. The
+      // microscope keeps its clean DIC look where membranes are outlines.
+      if (bacteriaView) continue;
+      const so = pCount * 8;
+      const predator = (flags & 2) !== 0;
+      _particleStage[so + 0] = px;
+      _particleStage[so + 1] = py;
+      _particleStage[so + 2] = r;
+      _particleStage[so + 3] = 0.0; // hard disc
+      const uc = predator ? PREDATOR_UNIT : ATOM_COLORS.a;
+      _particleStage[so + 4] = uc[0];
+      _particleStage[so + 5] = uc[1];
+      _particleStage[so + 6] = uc[2];
+      _particleStage[so + 7] = inLoop[i] ? ALPHA.aInLoop : ALPHA.aInChain;
+      pCount++;
+      continue;
+    }
     const state = unpackState(atoms[o + 2]);
     const type  = unpackType(atoms[o + 2]);
-    const px = _displayX[i], py = _displayY[i];
     // Water atoms ('w') always render via the soup path regardless of
     // state. Spent water (state=1) is the same visual as fresh water
     // — it's the same molecule, just chemically used. Without this
@@ -563,9 +606,9 @@ export function drawGPU(
         _particleStage[so + 1] = py;
         _particleStage[so + 2] = r * 0.55; // slightly smaller than soup
         _particleStage[so + 3] = 0.0;       // hard disc, no fade
-        _particleStage[so + 4] = 0.4;
-        _particleStage[so + 5] = 0.8;
-        _particleStage[so + 6] = 1.0;
+        _particleStage[so + 4] = ATOM_COLORS.w[0];
+        _particleStage[so + 5] = ATOM_COLORS.w[1];
+        _particleStage[so + 6] = ATOM_COLORS.w[2];
         _particleStage[so + 7] = 0.45;      // moderate alpha — visible but not loud
       } else if (bacteriaView) {
         const h = atomHash32(i, type, state);
@@ -579,27 +622,39 @@ export function drawGPU(
         if (isBubble) { _particleStage[so + 4] = 0.235; _particleStage[so + 5] = 0.176; _particleStage[so + 6] = 0.118; _particleStage[so + 7] = 0.28; }
         else          { _particleStage[so + 4] = 0.314; _particleStage[so + 5] = 0.235; _particleStage[so + 6] = 0.157; _particleStage[so + 7] = 0.20; }
       } else {
-        // Educational: hard-edged colored disc, full size
+        // Educational: hard-edged colored disc, full size. Free 'a' is
+        // the bulk of the soup — it renders at 5 % alpha, just enough to
+        // see the raw membrane material drifting around.
         const ch = String.fromCharCode(type);
         const c = colorFor(ch);
         _particleStage[so + 0] = px;
         _particleStage[so + 1] = py;
         _particleStage[so + 2] = r;
         _particleStage[so + 3] = 0.0;  // hard disc
-        _particleStage[so + 4] = c[0]; _particleStage[so + 5] = c[1]; _particleStage[so + 6] = c[2];
-        _particleStage[so + 7] = ch === 'p' ? 0.34 : 0.10;
+        if (flags & 32) {
+          // Propelled dart atom — glow bright gold so the shot reads
+          // clearly in flight (matches the 2D renderer's tracer pass).
+          _particleStage[so + 2] = r * 1.4;
+          _particleStage[so + 4] = 1.0; _particleStage[so + 5] = 0.78; _particleStage[so + 6] = 0.24;
+          _particleStage[so + 7] = 0.95;
+        } else {
+          _particleStage[so + 4] = c[0]; _particleStage[so + 5] = c[1]; _particleStage[so + 6] = c[2];
+          _particleStage[so + 7] = ch === 'p' ? ALPHA.soupLysin
+                                            : ch === 'a' ? ALPHA.aFree
+                                            : ALPHA.soup;
+        }
       }
       pCount++;
     } else {
-      // Active organelle / colored atom
-      const h = atomHash32(i, type, state);
-      const sizeMul = 1.1 + (h % 900) / 1000;
-      const pr = r * sizeMul;
+      // Active organelle / colored atom. The per-atom size jitter is a
+      // microscope-view effect; the educational view draws uniform discs
+      // (same as the 2D renderer) so atom size does not fake a state.
       const so = oCount * 8;
       _organelleStage[so + 0] = px;
       _organelleStage[so + 1] = py;
-      _organelleStage[so + 2] = pr;
       if (bacteriaView) {
+        const h = atomHash32(i, type, state);
+        _organelleStage[so + 2] = r * (1.1 + (h % 900) / 1000);
         const ch = String.fromCharCode(type);
         const isDense = ch === 'd' || ch === 'e' || ch === 'f';
         const isBonded = (flags & 1) !== 0;
@@ -610,9 +665,10 @@ export function drawGPU(
       } else {
         const ch = String.fromCharCode(type);
         const c = colorFor(ch);
+        _organelleStage[so + 2] = r;
         _organelleStage[so + 3] = 0.0; // soft blob
         _organelleStage[so + 4] = c[0]; _organelleStage[so + 5] = c[1]; _organelleStage[so + 6] = c[2];
-        _organelleStage[so + 7] = 0.80;
+        _organelleStage[so + 7] = ALPHA.organelle;
       }
       oCount++;
     }
@@ -770,18 +826,6 @@ export function drawGPU(
   }
 
   // ── Stage open membrane chains + non-membrane bond network ────────────────
-  // Build inLoop bit-vector
-  const inLoop = new Uint8Array(atomCount);
-  {
-    let c2 = 1;
-    for (let li = 0; li < loops[0]; li++) {
-      const vc = loops[c2++];
-      c2 += 1; // kind
-      for (let i = 0; i < vc; i++) inLoop[loops[c2 + i]] = 1;
-      c2 += vc;
-    }
-  }
-
   const bondCount = bonds[0];
   for (let bi = 0; bi < bondCount; bi++) {
     if (segCount >= MAX_SEG_INSTANCES) break;
@@ -803,8 +847,8 @@ export function drawGPU(
         if (isPredBond) { baseW = 1.0; R = 60/255;  G = 25/255;  B = 20/255;  A = 0.85; }
         else            { baseW = 1.0; R = 50/255;  G = 40/255;  B = 30/255;  A = 0.78; }
       } else {
-        if (isPredBond) { baseW = 2.5; R = 200/255; G = 30/255;  B = 0/255;   A = 0.92; }
-        else            { baseW = 2.5; R = 200/255; G = 168/255; B = 0/255;   A = 0.92; }
+        const [lr, lg, lb] = isPredBond ? PREDATOR_LINE : MEMBRANE_LINE;
+        baseW = 2.5; R = lr; G = lg; B = lb; A = 0.92;
       }
     } else {
       // Non-membrane bond — only drawn in educational view
@@ -901,18 +945,8 @@ export function setCustomAtomColor(type: string, rgb: [number, number, number]):
 export function clearCustomAtomColors(): void { _customColors.clear(); }
 
 function colorFor(type: string): [number, number, number] {
-  const custom = _customColors.get(type);
-  if (custom) return custom;
-  switch (type) {
-    case 'e': return [1.0, 0.2, 0.2];
-    case 'f': return [0.2, 1.0, 0.2];
-    case 'b': return [0.533, 0.533, 0.533];
-    case 'c': return [0.0, 0.867, 0.867];
-    case 'd': return [0.2, 0.4, 1.0];
-    case 'p': return [1.0, 0.467, 0.0];
-    case 'w': return [0.4, 0.8, 1.0];
-    default:  return [1.0, 0.2, 0.2];
-  }
+  // Theme colors + lab-defined customs — everything tunable in theme.ts
+  return _customColors.get(type) ?? ATOM_COLORS[type] ?? FALLBACK_COLOR;
 }
 
 // silence unused-warning so noUnusedLocals doesn't complain
